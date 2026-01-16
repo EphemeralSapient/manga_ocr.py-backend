@@ -65,7 +65,7 @@ from config import (
     get_ocr_model, get_ocr_mmproj, get_translate_model, get_cerebras_api_key,
     get_ocr_server_url, get_translate_server_url, get_auto_start_servers,
     get_llama_cli_path, get_llama_context_size, get_llama_gpu_layers,
-    get_server_port, needs_llama,
+    get_server_port, needs_llama, get_sequential_model_loading,
 )
 
 # Load configuration
@@ -76,6 +76,7 @@ CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", get_cerebras_api_key())
 OCR_METHOD = get_ocr_method()
 TRANSLATE_METHOD = get_translate_method()
 AUTO_START_SERVERS = get_auto_start_servers()
+SEQUENTIAL_MODEL_LOADING = get_sequential_model_loading()
 
 # Determine default translate mode based on config
 # NOTE: VLM translation disabled - Qwen 3 VL hallucinates instead of reading text
@@ -269,6 +270,251 @@ def _start_llama_servers():
                 print(f"    Still waiting... ({i}s)")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Sequential Model Manager - For low VRAM GPUs
+# Loads only one model at a time: OCR -> kill -> Translate -> kill
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SequentialModelManager:
+    """
+    Manages llama-server instances for sequential model loading.
+    Loads one model at a time to minimize VRAM usage.
+    Meant for budget GPUs (4-6GB VRAM).
+    """
+
+    def __init__(self):
+        self._ocr_process = None
+        self._translate_process = None
+        self._lock = None  # Lazy init threading lock
+
+    def _get_lock(self):
+        """Lazy init lock to avoid issues at import time."""
+        if self._lock is None:
+            import threading
+            self._lock = threading.Lock()
+        return self._lock
+
+    def _wait_for_server(self, url, timeout=120, check_fn=None):
+        """Wait for server to be ready."""
+        import time
+        check_fn = check_fn or (lambda: False)
+        for i in range(timeout):
+            try:
+                import requests
+                r = requests.get(f"{url}/health", timeout=2)
+                if r.status_code == 200:
+                    return True
+            except:
+                pass
+
+            if check_fn():
+                return True
+
+            time.sleep(1)
+            if i > 0 and i % 15 == 0:
+                print(f"    Still waiting for server... ({i}s)")
+        return False
+
+    def _kill_process(self, process):
+        """Kill a subprocess and wait for it to terminate."""
+        if process is None:
+            return
+
+        try:
+            import signal
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except:
+                process.kill()
+                process.wait(timeout=2)
+        except Exception as e:
+            print(f"  Warning: Error killing process: {e}")
+
+    def start_ocr_server(self):
+        """Start OCR llama-server (kills translate server if running)."""
+        with self._get_lock():
+            # Kill translate server first to free VRAM
+            if self._translate_process is not None:
+                print("  [Sequential] Stopping translation server to free VRAM...")
+                self._kill_process(self._translate_process)
+                self._translate_process = None
+                time.sleep(1)  # Wait for VRAM to be released
+
+            # Check if OCR server already running
+            if check_vlm_server():
+                return True
+
+            llama_server = _find_llama_server()
+            if not llama_server:
+                print("  [Sequential] llama-server not found")
+                return False
+
+            # Get config
+            context_size = str(get_llama_context_size())
+            gpu_layers = str(get_llama_gpu_layers())
+            ocr_model = get_ocr_model()
+            ocr_mmproj = get_ocr_mmproj()
+
+            # Download mmproj if needed
+            mmproj_path = None
+            if ocr_mmproj and ':' in ocr_mmproj:
+                repo, filename = ocr_mmproj.rsplit(':', 1)
+                cache_dir = os.path.expanduser('~/.cache/llama.cpp')
+                os.makedirs(cache_dir, exist_ok=True)
+                mmproj_path = os.path.join(cache_dir, filename)
+
+                if not os.path.exists(mmproj_path):
+                    url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
+                    print(f"  [Sequential] Downloading mmproj: {filename}...")
+                    try:
+                        import urllib.request
+                        urllib.request.urlretrieve(url, mmproj_path)
+                    except Exception as e:
+                        print(f"  Warning: Failed to download mmproj: {e}")
+                        mmproj_path = None
+
+            # Start server
+            print(f"  [Sequential] Starting OCR server ({ocr_model})...")
+            env = os.environ.copy()
+            env['LD_LIBRARY_PATH'] = '/usr/local/lib:' + env.get('LD_LIBRARY_PATH', '')
+
+            log_dir = os.path.join(os.path.dirname(__file__), '.llama_logs')
+            os.makedirs(log_dir, exist_ok=True)
+
+            cmd = [llama_server, '-hf', ocr_model, '--port', '8080', '-c', context_size, '-ngl', gpu_layers]
+            if mmproj_path:
+                cmd.extend(['--mmproj', mmproj_path])
+            cmd.extend(['--image-min-tokens', '1024'])
+
+            import subprocess
+            with open(os.path.join(log_dir, 'ocr_sequential.log'), 'w') as log:
+                self._ocr_process = subprocess.Popen(
+                    cmd,
+                    env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+                )
+
+            # Wait for server to be ready
+            if self._wait_for_server(get_ocr_server_url(), timeout=120, check_fn=check_vlm_server):
+                print(f"  [Sequential] OCR server ready")
+                return True
+            else:
+                print(f"  [Sequential] OCR server failed to start")
+                return False
+
+    def stop_ocr_server(self):
+        """Stop OCR llama-server to free VRAM."""
+        with self._get_lock():
+            if self._ocr_process is not None:
+                print("  [Sequential] Stopping OCR server...")
+                self._kill_process(self._ocr_process)
+                self._ocr_process = None
+                time.sleep(1)  # Wait for VRAM to be released
+
+            # Also kill any orphaned processes on port 8080
+            import subprocess
+            import platform
+            try:
+                if platform.system() != 'Windows':
+                    subprocess.run(['pkill', '-f', 'llama-server.*--port.*8080'],
+                                  capture_output=True, timeout=5)
+            except:
+                pass
+
+    def start_translate_server(self):
+        """Start translation llama-server (kills OCR server if running)."""
+        with self._get_lock():
+            # Kill OCR server first to free VRAM
+            if self._ocr_process is not None:
+                print("  [Sequential] Stopping OCR server to free VRAM...")
+                self._kill_process(self._ocr_process)
+                self._ocr_process = None
+                time.sleep(1)  # Wait for VRAM to be released
+
+            # Also kill any orphaned OCR server
+            import subprocess
+            import platform
+            try:
+                if platform.system() != 'Windows':
+                    subprocess.run(['pkill', '-f', 'llama-server.*--port.*8080'],
+                                  capture_output=True, timeout=5)
+                    time.sleep(0.5)
+            except:
+                pass
+
+            # Check if translate server already running
+            if check_translate_server():
+                return True
+
+            llama_server = _find_llama_server()
+            if not llama_server:
+                print("  [Sequential] llama-server not found")
+                return False
+
+            # Get config
+            context_size = str(get_llama_context_size())
+            gpu_layers = str(get_llama_gpu_layers())
+            translate_model = get_translate_model()
+
+            # Start server
+            print(f"  [Sequential] Starting translation server ({translate_model})...")
+            env = os.environ.copy()
+            env['LD_LIBRARY_PATH'] = '/usr/local/lib:' + env.get('LD_LIBRARY_PATH', '')
+
+            log_dir = os.path.join(os.path.dirname(__file__), '.llama_logs')
+            os.makedirs(log_dir, exist_ok=True)
+
+            import subprocess
+            with open(os.path.join(log_dir, 'translate_sequential.log'), 'w') as log:
+                self._translate_process = subprocess.Popen(
+                    [llama_server, '-hf', translate_model, '--port', '8081', '-c', context_size, '-ngl', gpu_layers],
+                    env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+                )
+
+            # Wait for server to be ready
+            if self._wait_for_server(get_translate_server_url(), timeout=120, check_fn=check_translate_server):
+                print(f"  [Sequential] Translation server ready")
+                return True
+            else:
+                print(f"  [Sequential] Translation server failed to start")
+                return False
+
+    def stop_translate_server(self):
+        """Stop translation llama-server to free VRAM."""
+        with self._get_lock():
+            if self._translate_process is not None:
+                print("  [Sequential] Stopping translation server...")
+                self._kill_process(self._translate_process)
+                self._translate_process = None
+                time.sleep(1)  # Wait for VRAM to be released
+
+            # Also kill any orphaned processes on port 8081
+            import subprocess
+            import platform
+            try:
+                if platform.system() != 'Windows':
+                    subprocess.run(['pkill', '-f', 'llama-server.*--port.*8081'],
+                                  capture_output=True, timeout=5)
+            except:
+                pass
+
+    def stop_all(self):
+        """Stop all llama-server instances."""
+        self.stop_ocr_server()
+        self.stop_translate_server()
+
+
+# Global sequential model manager instance
+_sequential_manager = None
+
+def get_sequential_manager():
+    """Get or create the sequential model manager."""
+    global _sequential_manager
+    if _sequential_manager is None:
+        _sequential_manager = SequentialModelManager()
+    return _sequential_manager
+
+
 app = Flask(__name__)
 
 # Global model instances (lazy loaded)
@@ -330,6 +576,13 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
     stats["bubbles_detected"] = len(bubbles)
     print(f"  [Detect] {len(bubbles)} bubbles in {detect_time:.0f}ms")
 
+    # Sequential model loading: start OCR server on demand
+    uses_vlm_ocr = OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8")
+    if SEQUENTIAL_MODEL_LOADING and uses_vlm_ocr and HAS_VLM_OCR:
+        seq_mgr = get_sequential_manager()
+        seq_mgr.start_ocr_server()
+        stats["sequential_mode"] = True
+
     # Grid and OCR (optionally with translation)
     t0 = time.time()
     if ocr_translate and HAS_VLM_OCR:
@@ -356,6 +609,11 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
     stats["ocr_lines"] = ocr_result.get('line_count', 0)
     is_translated = ocr_result.get('translated', False)
     print(f"  [OCR] {ocr_result.get('line_count', 0)} lines in {ocr_time}ms" + (" (translated)" if is_translated else ""))
+
+    # Sequential model loading: stop OCR server after OCR is done
+    if SEQUENTIAL_MODEL_LOADING and uses_vlm_ocr and HAS_VLM_OCR:
+        seq_mgr = get_sequential_manager()
+        seq_mgr.stop_ocr_server()
 
     # Map OCR to bubbles
     bubble_texts = map_ocr(ocr_result, positions)
@@ -393,6 +651,12 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
                 text_mapping.append((page_idx, bubble['idx']))
 
     stats["texts_to_translate"] = len(all_texts)
+
+    # Sequential model loading: start translate server if using local LLM
+    uses_local_translate = translate_local and HAS_LOCAL_TRANSLATE and TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt")
+    if SEQUENTIAL_MODEL_LOADING and uses_local_translate and not is_already_translated:
+        seq_mgr = get_sequential_manager()
+        seq_mgr.start_translate_server()
 
     # Translate (skip if VLM already provided translations)
     t0 = time.time()
@@ -440,6 +704,11 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
         stats["translations_success"] = success_count
         stats["translations_failed"] = len(translations) - success_count
         stats["translate_method"] = "cerebras_api"
+
+    # Sequential model loading: stop translate server after translation is done
+    if SEQUENTIAL_MODEL_LOADING and uses_local_translate and not is_already_translated:
+        seq_mgr = get_sequential_manager()
+        seq_mgr.stop_translate_server()
 
     # Build translation lookup per page
     translation_data = {}
@@ -550,10 +819,22 @@ def process_images_label2(images: List[Image.Image], api_key: str = None, output
     bubbles_l2, detect_time = detect_all(session, images, mode, target_label=2)
     print(f"  Detected {len(bubbles_l1)} text bubbles, {len(bubbles_l2)} text-free regions in {detect_time:.0f}ms")
 
+    # Sequential model loading: start OCR server on demand
+    uses_vlm_ocr = OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8")
+    if SEQUENTIAL_MODEL_LOADING and uses_vlm_ocr and HAS_VLM_OCR:
+        seq_mgr = get_sequential_manager()
+        seq_mgr.start_ocr_server()
+        stats["sequential_mode"] = True
+
     # Grid and OCR for label 1 (text bubbles)
     grid, positions = grid_bubbles(bubbles_l1)
     ocr_result = run_ocr(grid)
     bubble_texts = map_ocr(ocr_result, positions)
+
+    # Sequential model loading: stop OCR server after OCR is done
+    if SEQUENTIAL_MODEL_LOADING and uses_vlm_ocr and HAS_VLM_OCR:
+        seq_mgr = get_sequential_manager()
+        seq_mgr.stop_ocr_server()
 
     # Build OCR data
     ocr_data = {}
@@ -654,12 +935,19 @@ def process_images_label2(images: List[Image.Image], api_key: str = None, output
     def do_translation():
         return translate_texts(all_texts, api_key=api_key, stats=stats)
 
-    print(f"  Running inpainting and translation in parallel...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        inpaint_future = executor.submit(do_inpainting)
-        translate_future = executor.submit(do_translation)
-        inpainted_images = inpaint_future.result()
-        translations = translate_future.result()
+    # Note: Label2 uses Cerebras API for translation by default (not local LLM)
+    # Inpainting uses PyTorch (not llama server), so no VRAM conflict with sequential mode
+    if SEQUENTIAL_MODEL_LOADING:
+        print(f"  [Sequential] Running inpainting first, then translation (API)...")
+        inpainted_images = do_inpainting()
+        translations = do_translation()
+    else:
+        print(f"  Running inpainting and translation in parallel...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            inpaint_future = executor.submit(do_inpainting)
+            translate_future = executor.submit(do_translation)
+            inpainted_images = inpaint_future.result()
+            translations = translate_future.result()
 
     # Build translation lookup
     translation_data = {}
@@ -979,6 +1267,8 @@ if __name__ == '__main__':
     if TRANSLATE_METHOD == 'cerebras_api':
         print(f"  API key: {'configured' if CEREBRAS_API_KEY else 'NOT SET'}")
     print(f"  Auto-start: {AUTO_START_SERVERS}")
+    if SEQUENTIAL_MODEL_LOADING:
+        print(f"  Sequential loading: ENABLED (low VRAM mode - one model at a time)")
 
     # Show llama.cpp config if needed
     if needs_llama():
@@ -1018,7 +1308,8 @@ if __name__ == '__main__':
     print("=" * 40)
 
     # Auto-start llama servers if configured and needed
-    if needs_llama() and AUTO_START_SERVERS:
+    if needs_llama() and AUTO_START_SERVERS and not SEQUENTIAL_MODEL_LOADING:
+        # Standard mode: start both servers at startup
         print("\nChecking llama servers...")
         _start_llama_servers()
         ocr_ok = check_vlm_server()
@@ -1026,6 +1317,11 @@ if __name__ == '__main__':
         print(f"  OCR Server (8080): {'Running' if ocr_ok else 'Not running'}")
         if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt") and not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm"):
             print(f"  Translate Server (8081): {'Running' if trans_ok else 'Not running'}")
+    elif needs_llama() and SEQUENTIAL_MODEL_LOADING:
+        # Sequential mode: servers started on demand per request
+        print("\n[Sequential Mode] llama servers will start/stop on demand per request")
+        print("  This is SLOW but uses less VRAM (only one model loaded at a time)")
+        print("  Ideal for GPUs with 4-6GB VRAM")
     elif needs_llama() and not AUTO_START_SERVERS:
         print("\nAuto-start disabled. Start llama servers manually:")
         llama_server = llama_server_path or "llama-server"

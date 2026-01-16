@@ -98,6 +98,12 @@ DEFAULT_CONFIG = {
     "llama_context_size": 2048,
     "llama_gpu_layers": 99,
 
+    # Sequential model loading - load only one model at a time to save VRAM
+    # When enabled: slower (models load/unload per request) but uses less VRAM
+    # When disabled: faster (both models stay loaded) but uses more VRAM
+    # Meant for budget GPUs with limited VRAM (e.g., 4-6GB)
+    "sequential_model_loading": False,
+
     # OCR grid settings (for VLM batch processing)
     "ocr_grid_max_cells": 9,  # Max bubbles per grid (e.g., 9 = 3x3)
 
@@ -282,6 +288,10 @@ def get_llama_gpu_layers() -> int:
 
 def get_ocr_grid_max_cells() -> int:
     return get("ocr_grid_max_cells", 9)
+
+def get_sequential_model_loading() -> bool:
+    """Check if sequential model loading is enabled (low VRAM mode)."""
+    return get("sequential_model_loading", False)
 
 # Detection settings
 def get_detection_threshold() -> float:
@@ -550,34 +560,49 @@ def show_vram_estimate(cfg: dict):
     """Show estimated VRAM usage."""
     ocr = cfg.get("ocr_method", "qwen_vlm")
     translate = cfg.get("translate_method", "qwen_vlm")
+    sequential = cfg.get("sequential_model_loading", False)
 
-    total_vram = 0
+    ocr_vram = 0
+    translate_vram = 0
     components = []
 
     if ocr == "qwen_vlm":
-        total_vram += 2.3  # Q8_0 ~1.8GB + mmproj Q8_0 ~445MB
+        ocr_vram = 2.3  # Q8_0 ~1.8GB + mmproj Q8_0 ~445MB
         components.append("Qwen VL ~2.3GB (OCR)")
     elif ocr == "lfm_vlm":
-        total_vram += 1.7  # Q8_0 ~1.25GB + mmproj ~450MB
+        ocr_vram = 1.7  # Q8_0 ~1.25GB + mmproj ~450MB
         components.append("LFM VL ~1.7GB (OCR)")
     elif ocr == "ministral_vlm_q4":
-        total_vram += 3.0  # Q4_K_M ~2.15GB + mmproj ~0.85GB
+        ocr_vram = 3.0  # Q4_K_M ~2.15GB + mmproj ~0.85GB
         components.append("Ministral Q4 ~3.0GB (OCR)")
     elif ocr == "ministral_vlm_q8":
-        total_vram += 4.5  # Q8_0 ~3.65GB + mmproj ~0.85GB
+        ocr_vram = 4.5  # Q8_0 ~3.65GB + mmproj ~0.85GB
         components.append("Ministral Q8 ~4.5GB (OCR)")
     elif ocr == "oneocr":
         components.append("OneOCR (no VRAM)")
 
     if translate == "hunyuan_mt":
-        total_vram += 1.1
+        translate_vram = 1.1
         components.append("HunyuanMT ~1.1GB")
     elif translate == "cerebras_api":
         components.append("Cerebras API (cloud)")
 
-    console.print(f"\n[bold]Estimated VRAM:[/] [cyan]~{total_vram}GB[/]")
+    # Calculate total based on sequential mode
+    if sequential and ocr_vram > 0 and translate_vram > 0:
+        # Sequential: only one model loaded at a time
+        total_vram = max(ocr_vram, translate_vram)
+        console.print(f"\n[bold]Estimated VRAM:[/] [cyan]~{total_vram}GB[/] [dim](sequential mode - one model at a time)[/]")
+        console.print(f"  [dim]• Peak usage: ~{total_vram}GB (larger of OCR/translate)[/]")
+    else:
+        # Parallel: both models loaded
+        total_vram = ocr_vram + translate_vram
+        console.print(f"\n[bold]Estimated VRAM:[/] [cyan]~{total_vram}GB[/]")
+
     for c in components:
         console.print(f"  [dim]• {c}[/]")
+
+    if sequential:
+        console.print(f"  [yellow]• Sequential mode: SLOW but low VRAM[/]")
 
 
 def show_summary(cfg: dict):
@@ -590,6 +615,7 @@ def show_summary(cfg: dict):
     ocr = cfg.get("ocr_method", "qwen_vlm")
     translate = cfg.get("translate_method", "qwen_vlm")
     lang = cfg.get("target_language", "en")
+    sequential = cfg.get("sequential_model_loading", False)
 
     ocr_names = {"qwen_vlm": "Qwen 3 VL", "lfm_vlm": "LFM 2.5 VL", "ministral_vlm_q4": "Ministral 3B Q4", "ministral_vlm_q8": "Ministral 3B Q8", "oneocr": "OneOCR"}
     translate_names = {"qwen_vlm": "Qwen 3 VL", "hunyuan_mt": "HunyuanMT", "cerebras_api": "Cerebras API"}
@@ -603,6 +629,11 @@ def show_summary(cfg: dict):
     table.add_row("Target Language", f"[bold]{LANGUAGES.get(lang, lang)}[/]")
     table.add_row("Server Port", str(cfg.get("server_port", 5000)))
     table.add_row("Output Dir", cfg.get("output_dir", "output"))
+
+    # Show sequential mode if enabled
+    if sequential:
+        table.add_row("", "")
+        table.add_row("Sequential Loading", "[yellow]Enabled[/] [dim](low VRAM mode)[/]")
 
     console.print(table)
 
