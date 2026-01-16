@@ -1,0 +1,31 @@
+# Manga Translation Server - Requirements
+#
+# Install: pip install -r requirements.txt
+# Then run: python install_runtime.py (auto-detects best ONNX Runtime)
+
+# Core
+numpy
+pillow
+requests
+flask
+python-dotenv
+rich
+
+# ML/Inference
+onnx
+
+# macOS only - CoreML export + MPS inpainting
+torch; sys_platform == 'darwin'
+torchvision; sys_platform == 'darwin'
+transformers; sys_platform == 'darwin'
+coremltools; sys_platform == 'darwin'
+
+# Translation API
+cerebras-cloud-sdk
+
+# NOTE: onnxruntime is installed separately by install_runtime.py
+# It detects your hardware and installs the optimal variant:
+#   - onnxruntime-gpu      (NVIDIA CUDA)
+#   - onnxruntime-directml (Windows GPU)
+#   - onnxruntime-openvino (Intel)
+#   - onnxruntime          (CPU / Apple Silicon with CoreML)

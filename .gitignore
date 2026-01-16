@@ -1,0 +1,19 @@
+__py*
+*.mlpackage*
+*venv*
+*.onnx
+*.pt
+*.json
+*.patch
+.venv
+input/*
+output/*
+
+# TensorRT cache
+.trt_cache/
+*.engine
+*.timing
+
+.env
+data/
+.llama_logs/
