@@ -46,7 +46,9 @@ import concurrent.futures
 from typing import List, Dict, Any, Tuple
 import numpy as np
 from PIL import Image
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
+import queue
+import threading
 
 # Import workflow components
 from workflow import detect_mode, create_session, detect_all, CROP_PADDING
@@ -65,7 +67,8 @@ from config import (
     get_ocr_model, get_ocr_mmproj, get_translate_model, get_cerebras_api_key,
     get_ocr_server_url, get_translate_server_url, get_auto_start_servers,
     get_llama_cli_path, get_llama_context_size, get_llama_gpu_layers,
-    get_server_port, needs_llama, get_sequential_model_loading,
+    get_server_port, needs_llama, get_sequential_model_loading, get_streaming_enabled,
+    get_ocr_grid_max_cells, get_translation_batch_size,
 )
 
 # Load configuration
@@ -77,6 +80,9 @@ OCR_METHOD = get_ocr_method()
 TRANSLATE_METHOD = get_translate_method()
 AUTO_START_SERVERS = get_auto_start_servers()
 SEQUENTIAL_MODEL_LOADING = get_sequential_model_loading()
+STREAMING_ENABLED = get_streaming_enabled()
+OCR_BATCH_SIZE = get_ocr_grid_max_cells()  # Bubbles per OCR grid (default: 9)
+TRANSLATE_BATCH_SIZE = get_translation_batch_size()  # Texts per translation batch (default: 25)
 
 # Determine default translate mode based on config
 # NOTE: VLM translation disabled - Qwen 3 VL hallucinates instead of reading text
@@ -1252,6 +1258,415 @@ def health():
     return jsonify({'status': 'ok'})
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SSE Streaming Endpoint - Parallel OCR→Translate Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _create_sse_event(event_type: str, data: dict) -> str:
+    """Create an SSE event string."""
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+def _run_ocr_batch(batch_bubbles: list):
+    """
+    Run OCR on a single batch of bubbles (OCR_BATCH_SIZE bubbles per grid).
+    Returns list of bubble_info dicts with original_text.
+    """
+    from workflow.ocr_vlm import VlmOCR, create_ocr_grid
+    vlm = VlmOCR()
+
+    # Create grid and run OCR
+    grid_img, positions, grid_info = create_ocr_grid(batch_bubbles)
+    ocr_result = vlm.run(grid_img, positions, grid_info, translate=False)
+
+    # Map OCR results to bubbles
+    bubble_texts = map_ocr(ocr_result, positions)
+
+    # Extract bubble info with original text
+    results = []
+    for pos in positions:
+        key = pos['key']
+        page_idx, bubble_idx = key
+        texts = bubble_texts.get(key, [])
+        merged = "".join([t['text'] for t in texts])
+        results.append({
+            'page_idx': page_idx,
+            'bubble_idx': bubble_idx,
+            'bubble_box': list(pos['bubble_box']),
+            'original_text': merged.strip() if merged.strip() else '',
+            'global_idx': None  # Will be set by caller
+        })
+
+    return results
+
+
+def _translate_texts_batch(texts: list, translate_local: bool, api_key: str) -> list:
+    """
+    Translate a batch of texts (TRANSLATE_BATCH_SIZE texts).
+    Returns list of translations.
+    """
+    if not texts:
+        return []
+
+    if translate_local and HAS_LOCAL_TRANSLATE:
+        translator = LlmTranslator()
+        result = translator.translate(texts)
+        return result.get('translations', [''] * len(texts))
+    else:
+        # Use Cerebras API
+        return translate_texts(texts, api_key=api_key)
+
+
+def _translate_batch_async(translate_batch_idx: int, bubble_infos: list, texts: list,
+                           translate_local: bool, api_key: str, result_queue: queue.Queue):
+    """
+    Translate a batch and put results in queue.
+    bubble_infos: list of bubble info dicts (with global_idx for ordering)
+    texts: list of texts to translate (aligned with bubble_infos that have text)
+    """
+    try:
+        # Translate
+        translations = _translate_texts_batch(texts, translate_local, api_key)
+
+        # Map translations back to bubble_infos
+        # Only bubbles with original_text get translations
+        text_idx = 0
+        batch_results = []
+        for info in bubble_infos:
+            result_info = dict(info)
+            if info['original_text']:
+                result_info['translated_text'] = translations[text_idx] if text_idx < len(translations) else '[MISSING]'
+                text_idx += 1
+            else:
+                result_info['translated_text'] = ''
+            batch_results.append(result_info)
+
+        result_queue.put({
+            'translate_batch_idx': translate_batch_idx,
+            'status': 'success',
+            'results': batch_results,
+            'translate_count': len([t for t in translations if t and t.strip()])
+        })
+
+    except Exception as e:
+        # On error, return bubble_infos with error translations
+        batch_results = []
+        for info in bubble_infos:
+            result_info = dict(info)
+            result_info['translated_text'] = '[TRANSLATE_ERROR]'
+            batch_results.append(result_info)
+
+        result_queue.put({
+            'translate_batch_idx': translate_batch_idx,
+            'status': 'error',
+            'error': str(e),
+            'results': batch_results
+        })
+
+
+@app.route('/translate/label1/stream', methods=['POST'])
+def translate_label1_stream():
+    """
+    SSE Streaming endpoint: detect -> parallel OCR+translate pipeline -> stream results
+
+    Two-stage pipeline with different batch sizes:
+    - OCR: processes OCR_BATCH_SIZE (9) bubbles per grid
+    - Translation: processes TRANSLATE_BATCH_SIZE (25) texts per batch
+
+    OCR runs sequentially, but translation runs in parallel as texts accumulate.
+    Results stream back in bubble order (page 0 bubble 0, page 0 bubble 1, etc.)
+
+    Response format (SSE events):
+      event: start
+      data: {"total_batches": N, "total_bubbles": M, "pages": P, "detect_ms": T}
+
+      event: result  (one per bubble, in order)
+      data: {"global_idx": 0, "page_idx": 0, "bubble_idx": 0, "bubble_box": [...],
+             "original_text": "...", "translated_text": "..."}
+
+      event: complete
+      data: {"total_time_ms": ..., "stats": {...}}
+
+      event: error
+      data: {"error": "..."}
+    """
+    if not STREAMING_ENABLED:
+        return jsonify({'error': 'Streaming not enabled. Set streaming_enabled: true in config.json'}), 400
+
+    if 'images' not in request.files:
+        return jsonify({'error': 'No images provided'}), 400
+
+    files = request.files.getlist('images')
+    if not files:
+        return jsonify({'error': 'No images provided'}), 400
+
+    # Get parameters
+    api_key = request.form.get('api_key', None)
+    translate_local_param = request.form.get('translate_local', None)
+    translate_local = (translate_local_param or '').lower() in ('true', '1', 'yes')
+    if translate_local_param is None:
+        translate_local = (DEFAULT_TRANSLATE_MODE == 'local')
+
+    # Validate API key for Cerebras mode
+    effective_api_key = api_key or CEREBRAS_API_KEY
+    if not translate_local and not effective_api_key:
+        return jsonify({
+            'error': 'No Cerebras API key provided. Set CEREBRAS_API_KEY env var, pass api_key parameter, or use translate_local=true'
+        }), 400
+
+    # Load images
+    try:
+        images = []
+        for f in files:
+            img = Image.open(f.stream).convert('RGB')
+            images.append(img)
+    except Exception as e:
+        return jsonify({'error': f'Failed to load images: {e}'}), 400
+
+    def generate_events():
+        """Generator for SSE events."""
+        start_time = time.time()
+        stats = {"pages": len(images), "streaming": True}
+
+        try:
+            # Detection
+            session, mode = get_detector()
+            bubbles, detect_time = detect_all(session, images, mode, target_label=1)
+            stats["detect_ms"] = int(detect_time)
+            stats["bubbles_detected"] = len(bubbles)
+
+            # Sequential mode: start OCR server
+            uses_vlm_ocr = OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8")
+            if SEQUENTIAL_MODEL_LOADING and uses_vlm_ocr and HAS_VLM_OCR:
+                seq_mgr = get_sequential_manager()
+                seq_mgr.start_ocr_server()
+
+            # Create batches (ordered by page, then bubble_idx within page)
+            # Bubbles are already sorted in detect_all
+            batch_size = OCR_BATCH_SIZE
+            batches = []
+            for i in range(0, len(bubbles), batch_size):
+                batches.append(bubbles[i:i + batch_size])
+
+            stats["total_batches"] = len(batches)
+
+            # Send start event
+            yield _create_sse_event("start", {
+                "total_batches": len(batches),
+                "total_bubbles": len(bubbles),
+                "pages": len(images),
+                "detect_ms": int(detect_time)
+            })
+
+            if not bubbles:
+                yield _create_sse_event("complete", {
+                    "total_time_ms": int((time.time() - start_time) * 1000),
+                    "stats": stats
+                })
+                return
+
+            # Two-stage pipeline with different batch sizes:
+            # Stage 1: OCR batches (OCR_BATCH_SIZE bubbles, e.g., 9)
+            # Stage 2: Translation batches (TRANSLATE_BATCH_SIZE texts, e.g., 25)
+            #
+            # Flow:
+            # - OCR runs sequentially (llama-server limitation)
+            # - Accumulate OCR results until we have enough for a translation batch
+            # - Translation runs in parallel threads (different server/API)
+            # - Stream results as translation batches complete, in bubble order
+
+            result_queue = queue.Queue()
+            translate_threads = []
+
+            # Accumulator for OCR results pending translation
+            pending_bubble_infos = []  # List of bubble_info dicts
+            pending_texts = []  # Texts to translate (only non-empty)
+            global_bubble_idx = 0
+            translate_batch_idx = 0
+
+            # Track which translate batches contain which global indices for ordering
+            translate_batch_ranges = {}  # translate_batch_idx -> (start_global_idx, end_global_idx)
+            completed_translate_batches = {}
+            next_global_idx_to_send = 0
+            all_results = {}  # global_idx -> result
+
+            def flush_to_translation():
+                """Send accumulated texts to translation in a separate thread."""
+                nonlocal translate_batch_idx, pending_bubble_infos, pending_texts
+
+                if not pending_bubble_infos:
+                    return
+
+                # Record range for this translate batch
+                start_idx = pending_bubble_infos[0]['global_idx']
+                end_idx = pending_bubble_infos[-1]['global_idx']
+                translate_batch_ranges[translate_batch_idx] = (start_idx, end_idx)
+
+                # Start translation thread
+                t = threading.Thread(
+                    target=_translate_batch_async,
+                    args=(translate_batch_idx, list(pending_bubble_infos), list(pending_texts),
+                          translate_local, effective_api_key, result_queue)
+                )
+                t.start()
+                translate_threads.append(t)
+
+                translate_batch_idx += 1
+                pending_bubble_infos = []
+                pending_texts = []
+
+            # Process OCR batches
+            for ocr_batch_idx, batch_bubbles in enumerate(batches):
+                try:
+                    # Run OCR for this batch (sequential)
+                    ocr_results = _run_ocr_batch(batch_bubbles)
+
+                    # Add global indices and accumulate
+                    for info in ocr_results:
+                        info['global_idx'] = global_bubble_idx
+                        pending_bubble_infos.append(info)
+                        if info['original_text']:
+                            pending_texts.append(info['original_text'])
+                        global_bubble_idx += 1
+
+                    # Check if we have enough texts for a translation batch
+                    while len(pending_texts) >= TRANSLATE_BATCH_SIZE:
+                        # Find cutoff point: take TRANSLATE_BATCH_SIZE texts worth of bubbles
+                        text_count = 0
+                        cutoff_idx = 0
+                        for i, info in enumerate(pending_bubble_infos):
+                            if info['original_text']:
+                                text_count += 1
+                            if text_count >= TRANSLATE_BATCH_SIZE:
+                                cutoff_idx = i + 1
+                                break
+
+                        # Split at cutoff
+                        batch_infos = pending_bubble_infos[:cutoff_idx]
+                        batch_texts = pending_texts[:TRANSLATE_BATCH_SIZE]
+                        pending_bubble_infos = pending_bubble_infos[cutoff_idx:]
+                        pending_texts = pending_texts[TRANSLATE_BATCH_SIZE:]
+
+                        # Record range and start translation
+                        start_idx = batch_infos[0]['global_idx']
+                        end_idx = batch_infos[-1]['global_idx']
+                        translate_batch_ranges[translate_batch_idx] = (start_idx, end_idx)
+
+                        t = threading.Thread(
+                            target=_translate_batch_async,
+                            args=(translate_batch_idx, batch_infos, batch_texts,
+                                  translate_local, effective_api_key, result_queue)
+                        )
+                        t.start()
+                        translate_threads.append(t)
+                        translate_batch_idx += 1
+
+                except Exception as e:
+                    # OCR failed, add error results
+                    for b in batch_bubbles:
+                        all_results[global_bubble_idx] = {
+                            'page_idx': b['page_idx'],
+                            'bubble_idx': b['bubble_idx'],
+                            'bubble_box': list(b['box']),
+                            'original_text': '[OCR_ERROR]',
+                            'translated_text': '[OCR_ERROR]',
+                            'global_idx': global_bubble_idx
+                        }
+                        global_bubble_idx += 1
+
+                # Check for completed translations and stream results
+                while not result_queue.empty():
+                    try:
+                        result = result_queue.get_nowait()
+                        batch_idx = result['translate_batch_idx']
+                        for r in result['results']:
+                            all_results[r['global_idx']] = r
+
+                        # Stream results in order
+                        while next_global_idx_to_send in all_results:
+                            r = all_results[next_global_idx_to_send]
+                            yield _create_sse_event("result", {
+                                'global_idx': r['global_idx'],
+                                'page_idx': r['page_idx'],
+                                'bubble_idx': r['bubble_idx'],
+                                'bubble_box': r['bubble_box'],
+                                'original_text': r['original_text'],
+                                'translated_text': r['translated_text']
+                            })
+                            del all_results[next_global_idx_to_send]
+                            next_global_idx_to_send += 1
+                    except queue.Empty:
+                        break
+
+            # Flush remaining pending texts to translation
+            if pending_bubble_infos:
+                flush_to_translation()
+
+            # Sequential mode: stop OCR server (done with OCR)
+            if SEQUENTIAL_MODEL_LOADING and uses_vlm_ocr and HAS_VLM_OCR:
+                seq_mgr = get_sequential_manager()
+                seq_mgr.stop_ocr_server()
+
+            # Wait for all translation threads
+            for t in translate_threads:
+                t.join(timeout=120)
+
+            # Collect remaining results
+            while not result_queue.empty():
+                try:
+                    result = result_queue.get_nowait()
+                    for r in result['results']:
+                        all_results[r['global_idx']] = r
+                except queue.Empty:
+                    break
+
+            # Stream any remaining results in order
+            total_bubbles = global_bubble_idx
+            while next_global_idx_to_send < total_bubbles:
+                if next_global_idx_to_send in all_results:
+                    r = all_results[next_global_idx_to_send]
+                    yield _create_sse_event("result", {
+                        'global_idx': r['global_idx'],
+                        'page_idx': r['page_idx'],
+                        'bubble_idx': r['bubble_idx'],
+                        'bubble_box': r['bubble_box'],
+                        'original_text': r['original_text'],
+                        'translated_text': r['translated_text']
+                    })
+                    del all_results[next_global_idx_to_send]
+                    next_global_idx_to_send += 1
+                else:
+                    # Missing result, wait a bit
+                    time.sleep(0.1)
+                    # Timeout check
+                    if time.time() - start_time > 300:  # 5 min timeout
+                        yield _create_sse_event("error", {"error": f"Timeout waiting for result {next_global_idx_to_send}"})
+                        break
+
+            # Send complete event
+            total_time = int((time.time() - start_time) * 1000)
+            stats["total_time_ms"] = total_time
+            yield _create_sse_event("complete", {
+                "total_time_ms": total_time,
+                "stats": stats
+            })
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield _create_sse_event("error", {"error": str(e)})
+
+    return Response(
+        generate_events(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no'  # Disable nginx buffering
+        }
+    )
+
+
 if __name__ == '__main__':
     print("Manga Translation Server")
     print("=" * 40)
@@ -1269,6 +1684,8 @@ if __name__ == '__main__':
     print(f"  Auto-start: {AUTO_START_SERVERS}")
     if SEQUENTIAL_MODEL_LOADING:
         print(f"  Sequential loading: ENABLED (low VRAM mode - one model at a time)")
+    if STREAMING_ENABLED:
+        print(f"  Streaming: ENABLED (SSE endpoint available)")
 
     # Show llama.cpp config if needed
     if needs_llama():
@@ -1282,6 +1699,8 @@ if __name__ == '__main__':
     print("Endpoints:")
     print("  POST /translate/label1  - Text bubbles (no inpainting)")
     print("  POST /translate/label2  - With inpainting")
+    if STREAMING_ENABLED:
+        print("  POST /translate/label1/stream - SSE streaming (parallel OCR→translate)")
     print("  GET  /health           - Health check")
     print("")
     print("Translation modes:")

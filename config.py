@@ -104,6 +104,11 @@ DEFAULT_CONFIG = {
     # Meant for budget GPUs with limited VRAM (e.g., 4-6GB)
     "sequential_model_loading": False,
 
+    # Streaming mode - enable SSE streaming endpoints for real-time results
+    # When enabled: /translate/label1/stream endpoint becomes available
+    # Results stream back as OCR→translate batches complete (lower latency)
+    "streaming_enabled": False,
+
     # OCR grid settings (for VLM batch processing)
     "ocr_grid_max_cells": 9,  # Max bubbles per grid (e.g., 9 = 3x3)
 
@@ -292,6 +297,10 @@ def get_ocr_grid_max_cells() -> int:
 def get_sequential_model_loading() -> bool:
     """Check if sequential model loading is enabled (low VRAM mode)."""
     return get("sequential_model_loading", False)
+
+def get_streaming_enabled() -> bool:
+    """Check if streaming endpoints are enabled."""
+    return get("streaming_enabled", False)
 
 # Detection settings
 def get_detection_threshold() -> float:
