@@ -30,6 +30,24 @@ _local_ocr = None
 _vlm_ocr = None
 _vlm_checked = False  # Track if we've done runtime check
 OCR_URL = "http://localhost:1377/ocr"
+
+
+def reset_vlm_ocr():
+    """Reset VLM OCR instance to allow model switching.
+
+    Call this when changing VLM models in config to force re-initialization.
+    """
+    global _vlm_ocr, _vlm_checked
+    if _vlm_ocr is not None:
+        # Stop any running server process
+        try:
+            _vlm_ocr.stop_server()
+        except Exception:
+            pass
+    _vlm_ocr = None
+    _vlm_checked = False
+
+
 SKIP_CHARS = {'ノ', 'ー', '一', '|'}
 
 # Determine which OCR backend to use

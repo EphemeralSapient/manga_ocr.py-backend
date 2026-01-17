@@ -453,9 +453,12 @@ class VlmOCR:
             model: Model identifier for starting server if needed
             max_cells_per_batch: Max cells to process at once (default from config)
         """
-        self.server_url = server_url or LLAMA_SERVER_URL
-        self.model = model or VLM_MODEL
-        self.max_cells_per_batch = max_cells_per_batch or OCR_GRID_MAX_CELLS
+        # Read config dynamically to support model switching
+        cfg = _load_config()
+        self.server_url = server_url or os.environ.get('LLAMA_SERVER_URL', cfg.get('ocr_server_url', 'http://localhost:8080'))
+        self.model = model or os.environ.get('VLM_MODEL', _get_ocr_model())
+        self.mmproj = _get_ocr_mmproj()
+        self.max_cells_per_batch = max_cells_per_batch or cfg.get('ocr_grid_max_cells', 9)
         self._server_process = None
 
     def _ensure_server(self):
@@ -479,7 +482,7 @@ class VlmOCR:
         cfg = _load_config()
         context_size = str(cfg.get('llama_context_size', 2048))
         gpu_layers = str(cfg.get('llama_gpu_layers', 99))
-        mmproj = cfg.get('ocr_mmproj') or _get_ocr_mmproj()
+        mmproj = self.mmproj  # Use instance mmproj set at init
 
         # Parse port from server_url
         import re
@@ -597,6 +600,24 @@ class VlmOCR:
         log_path = os.path.abspath(log_file)
         print(f"[VLM OCR] Check logs at: {log_path}")
         return False
+
+    def stop_server(self):
+        """Stop the llama-server process if we started it."""
+        if self._server_process is not None:
+            try:
+                # Try graceful termination first
+                self._server_process.terminate()
+                try:
+                    self._server_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # Force kill if it doesn't stop
+                    self._server_process.kill()
+                    self._server_process.wait()
+                print(f"[VLM OCR] Server stopped")
+            except Exception as e:
+                print(f"[VLM OCR] Error stopping server: {e}")
+            finally:
+                self._server_process = None
 
     def _stream_with_early_abort(self, response, expected_cells=None):
         """

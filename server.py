@@ -52,7 +52,7 @@ import threading
 
 # Import workflow components
 from workflow import detect_mode, create_session, detect_all, CROP_PADDING
-from workflow import grid_bubbles, run_ocr, run_ocr_on_bubbles, map_ocr, HAS_LFM_OCR, HAS_VLM_OCR
+from workflow import grid_bubbles, run_ocr, run_ocr_on_bubbles, map_ocr, reset_vlm_ocr, HAS_LFM_OCR, HAS_VLM_OCR
 from workflow import create_inpainter, Inpainter
 from workflow import render_text_on_image
 from workflow import translate_texts
@@ -1256,6 +1256,27 @@ def translate_label2():
 def health():
     """Health check endpoint."""
     return jsonify({'status': 'ok'})
+
+
+@app.route('/reset-vlm', methods=['POST'])
+def reset_vlm():
+    """Reset VLM OCR instance to allow model switching.
+
+    Call this after changing ocr_method in config.json to reload the model.
+    """
+    try:
+        reset_vlm_ocr()
+        # Reload config to get new model info
+        from config import load_config, get_ocr_method, get_ocr_model
+        cfg = load_config()
+        return jsonify({
+            'status': 'ok',
+            'message': 'VLM OCR instance reset. Next OCR request will use new model.',
+            'ocr_method': get_ocr_method(),
+            'ocr_model': get_ocr_model()
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'error': str(e)}), 500
 
 
 # ─────────────────────────────────────────────────────────────────────────────
