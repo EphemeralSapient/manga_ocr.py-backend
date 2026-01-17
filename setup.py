@@ -294,15 +294,16 @@ def setup_llama():
     has_nvidia = shutil.which('nvidia-smi') is not None
 
     if PY == 'Darwin':
-        # macOS instructions
+        # macOS instructions - Metal GPU is auto-enabled
         install_instructions = (
             "[bold]Option 1: Homebrew (recommended)[/]\n"
             "  [cyan]brew install llama.cpp[/]\n\n"
             "[bold]Option 2: Build from source[/]\n"
             "  [cyan]git clone https://github.com/ggerganov/llama.cpp[/]\n"
             "  [cyan]cd llama.cpp[/]\n"
-            "  [cyan]cmake -B build[/]\n"
+            "  [cyan]cmake -B build -DGGML_METAL=ON[/]\n"
             "  [cyan]cmake --build build --config Release -j[/]\n\n"
+            "[bold yellow]Note:[/] Metal GPU acceleration is enabled by default on macOS.\n\n"
             "[bold]Option 3: Pre-built binaries[/]\n"
             "  [dim]https://github.com/ggerganov/llama.cpp/releases[/]"
         )
@@ -783,11 +784,12 @@ def show_next_steps():
 
     if needs_llama() and not find_llama():
         if PY == 'Darwin':
-            steps += "[bold]Install llama.cpp:[/]\n  [cyan]brew install llama.cpp[/]\n\n"
+            steps += "[bold]Install llama.cpp:[/]\n  [cyan]brew install llama.cpp[/]\n  [dim](Metal GPU auto-enabled)[/]\n\n"
         elif shutil.which('nvidia-smi'):
             steps += (
                 "[bold]Install llama.cpp (with CUDA):[/]\n"
                 "  [cyan]sudo apt install libcurl4-openssl-dev libssl-dev[/]\n"
+                "  [cyan]git clone https://github.com/ggerganov/llama.cpp[/]\n"
                 "  [cyan]cd llama.cpp && cmake -B build -DGGML_CUDA=ON[/]\n"
                 "  [cyan]cmake --build build --config Release -j[/]\n\n"
             )
@@ -795,6 +797,7 @@ def show_next_steps():
             steps += (
                 "[bold]Install llama.cpp:[/]\n"
                 "  [cyan]sudo apt install libcurl4-openssl-dev libssl-dev[/]\n"
+                "  [cyan]git clone https://github.com/ggerganov/llama.cpp[/]\n"
                 "  [cyan]cd llama.cpp && cmake -B build[/]\n"
                 "  [cyan]cmake --build build --config Release -j[/]\n\n"
             )
