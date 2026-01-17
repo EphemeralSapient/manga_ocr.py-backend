@@ -56,7 +56,7 @@ DEFAULT_CONFIG = {
     # User Settings (shown in wizard)
     # ══════════════════════════════════════════════════════════════════════════
 
-    # OCR method: "qwen_vlm" | "lfm_vlm" | "ministral_vlm_q4" | "ministral_vlm_q8" | "oneocr"
+    # OCR method: "qwen_vlm" | "lfm_vlm" | "ministral_vlm_q8" | "oneocr"
     "ocr_method": "qwen_vlm",
 
     # Translation method: "hunyuan_mt" | "cerebras_api"
@@ -227,11 +227,6 @@ VLM_MODELS = {
         "min_p": 0.15,
         "repetition_penalty": 1.05,
     },
-    "ministral_vlm_q4": {
-        "model": "mistralai/Ministral-3-3B-Instruct-2512-GGUF:Ministral-3-3B-Instruct-2512-Q4_K_M.gguf",
-        "mmproj": "mistralai/Ministral-3-3B-Instruct-2512-GGUF:Ministral-3-3B-Instruct-2512-BF16-mmproj.gguf",
-        "temperature": 0.1,  # Low temp for production
-    },
     "ministral_vlm_q8": {
         "model": "mistralai/Ministral-3-3B-Instruct-2512-GGUF:Ministral-3-3B-Instruct-2512-Q8_0.gguf",
         "mmproj": "mistralai/Ministral-3-3B-Instruct-2512-GGUF:Ministral-3-3B-Instruct-2512-BF16-mmproj.gguf",
@@ -338,12 +333,116 @@ def needs_llama() -> bool:
     """Check if current config needs llama.cpp."""
     ocr = get_ocr_method()
     translate = get_translate_method()
-    vlm_methods = ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8")
+    vlm_methods = ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8")
     return ocr in vlm_methods or translate in ("qwen_vlm", "hunyuan_mt")
 
 def uses_same_model_for_ocr_and_translate() -> bool:
     """Check if OCR and translation use the same model."""
     return get_ocr_method() == "qwen_vlm" and get_translate_method() == "qwen_vlm"
+
+# VLM method constants
+VLM_METHODS = ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8")
+
+def is_vlm_method(method: str) -> bool:
+    """Check if method is a VLM-based method."""
+    return method in VLM_METHODS
+
+def get_target_language_name() -> str:
+    """Get the full name of the target language."""
+    lang_code = get_target_language()
+    return LANGUAGES.get(lang_code, lang_code.capitalize())
+
+def get_ocr_gen_params() -> dict:
+    """Get all generation params for current OCR model."""
+    ocr_method = get_ocr_method()
+    if ocr_method in VLM_MODELS:
+        model_cfg = VLM_MODELS[ocr_method]
+        return {
+            "temperature": model_cfg.get("temperature", 0.7),
+            "min_p": model_cfg.get("min_p"),
+            "top_p": model_cfg.get("top_p", 0.8),
+            "top_k": model_cfg.get("top_k", 20),
+            "repetition_penalty": model_cfg.get("repetition_penalty", 1.0),
+            "presence_penalty": model_cfg.get("presence_penalty", 1.5),
+        }
+    return {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5, "repetition_penalty": 1.0}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Llama.cpp Utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+import shutil
+
+def find_llama() -> str | None:
+    """Find llama-server executable. Checks config, PATH, and common locations."""
+    cfg_path = get_llama_cli_path()
+
+    # Check config.json llama_cli_path first
+    if cfg_path:
+        if os.path.isdir(cfg_path):
+            for name in ['llama-server', 'llama-cli', 'llama-server.exe', 'llama-cli.exe']:
+                path = os.path.join(cfg_path, name)
+                if os.path.exists(path) and os.access(path, os.X_OK):
+                    return path
+        elif os.path.isfile(cfg_path) and os.access(cfg_path, os.X_OK):
+            return cfg_path
+        elif os.path.isfile(cfg_path):
+            parent = os.path.dirname(cfg_path)
+            for name in ['llama-server', 'llama-cli']:
+                path = os.path.join(parent, name)
+                if os.path.exists(path) and os.access(path, os.X_OK):
+                    return path
+
+    # Check PATH and common locations
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for name in ['llama-server', 'llama-cli']:
+        paths = [
+            shutil.which(name) or '',
+            os.path.join(script_dir, 'llama.cpp', 'build', 'bin', name),
+            os.path.join(script_dir, 'llama.cpp', name),
+            f'./llama.cpp/build/bin/{name}',
+            f'./llama.cpp/{name}',
+            f'./{name}',
+            os.path.expanduser(f'~/llama.cpp/build/bin/{name}'),
+            os.path.expanduser(f'~/llama.cpp/{name}'),
+            f'/usr/local/bin/{name}',
+            f'/opt/homebrew/bin/{name}',
+        ]
+        for p in paths:
+            if p and os.path.exists(p) and os.access(p, os.X_OK):
+                return p
+    return None
+
+def download_mmproj(mmproj: str) -> str | None:
+    """Download mmproj file if needed. Returns local path or None."""
+    if not mmproj or ':' not in mmproj:
+        return None
+
+    repo, filename = mmproj.rsplit(':', 1)
+    cache_dir = os.path.expanduser('~/.cache/llama.cpp')
+    os.makedirs(cache_dir, exist_ok=True)
+    mmproj_path = os.path.join(cache_dir, filename)
+
+    if os.path.exists(mmproj_path):
+        return mmproj_path
+
+    url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
+    try:
+        import urllib.request
+        urllib.request.urlretrieve(url, mmproj_path)
+        return mmproj_path
+    except Exception:
+        return None
+
+def build_llama_command(llama_path: str, model: str, port: str, mmproj_path: str = None) -> list:
+    """Build llama-server command with standard options."""
+    ctx = str(get_llama_context_size())
+    ngl = str(get_llama_gpu_layers())
+    cmd = [llama_path, '-hf', model, '--port', port, '-c', ctx, '-ngl', ngl]
+    if mmproj_path:
+        cmd.extend(['--mmproj', mmproj_path])
+    cmd.extend(['--image-min-tokens', '1024'])
+    return cmd
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Interactive Prompts
@@ -473,7 +572,6 @@ def run_wizard() -> dict:
         ocr_options = [
             ("qwen_vlm", f"Qwen 3 VL 2B - Vision model for OCR [cyan](~2.3GB VRAM)[/]"),
             ("lfm_vlm", f"LFM 2.5 VL 1.6B - Smaller & faster [cyan](~1.7GB VRAM)[/]"),
-            ("ministral_vlm_q4", f"Ministral 3B Q4 - Good quality [cyan](~3.0GB VRAM)[/]"),
             ("ministral_vlm_q8", f"Ministral 3B Q8 - Best quality [cyan](~4.5GB VRAM)[/]"),
         ]
 
@@ -581,9 +679,6 @@ def show_vram_estimate(cfg: dict):
     elif ocr == "lfm_vlm":
         ocr_vram = 1.7  # Q8_0 ~1.25GB + mmproj ~450MB
         components.append("LFM VL ~1.7GB (OCR)")
-    elif ocr == "ministral_vlm_q4":
-        ocr_vram = 3.0  # Q4_K_M ~2.15GB + mmproj ~0.85GB
-        components.append("Ministral Q4 ~3.0GB (OCR)")
     elif ocr == "ministral_vlm_q8":
         ocr_vram = 4.5  # Q8_0 ~3.65GB + mmproj ~0.85GB
         components.append("Ministral Q8 ~4.5GB (OCR)")
@@ -626,7 +721,7 @@ def show_summary(cfg: dict):
     lang = cfg.get("target_language", "en")
     sequential = cfg.get("sequential_model_loading", False)
 
-    ocr_names = {"qwen_vlm": "Qwen 3 VL", "lfm_vlm": "LFM 2.5 VL", "ministral_vlm_q4": "Ministral 3B Q4", "ministral_vlm_q8": "Ministral 3B Q8", "oneocr": "OneOCR"}
+    ocr_names = {"qwen_vlm": "Qwen 3 VL", "lfm_vlm": "LFM 2.5 VL", "ministral_vlm_q8": "Ministral 3B Q8", "oneocr": "OneOCR"}
     translate_names = {"qwen_vlm": "Qwen 3 VL", "hunyuan_mt": "HunyuanMT", "cerebras_api": "Cerebras API"}
 
     table.add_row("OCR", f"[bold]{ocr_names.get(ocr, ocr)}[/]")

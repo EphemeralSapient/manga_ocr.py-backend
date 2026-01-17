@@ -31,10 +31,11 @@ console = Console()
 from config import (
     load_config, config_exists, run_wizard, show_summary, show_vram_estimate,
     get_venv_path, get_python_version, get_server_port, get_target_language,
-    get_ocr_method, get_ocr_model, get_translate_method, get_translate_model,
+    get_ocr_method, get_ocr_model, get_ocr_mmproj, get_translate_method, get_translate_model,
     get_script_path, get_llama_cli_path, get_cerebras_api_key, get_output_dir,
     get_ocr_server_url, get_translate_server_url, get_auto_start_servers,
-    needs_llama, LANGUAGES,
+    get_llama_context_size, get_llama_gpu_layers,
+    needs_llama, find_llama, download_mmproj, build_llama_command, LANGUAGES,
     ok, warn, err, info, CONFIG_FILE
 )
 
@@ -207,54 +208,6 @@ def download_models():
 # Component Setup
 # ─────────────────────────────────────────────────────────────────────────────
 
-def find_llama():
-    """Find llama-cli or llama-server executable."""
-    cfg_path = get_llama_cli_path()
-
-    # Check config.json llama_cli_path first
-    if cfg_path:
-        # If it's a directory, look for llama-server/llama-cli inside it
-        if os.path.isdir(cfg_path):
-            for name in ['llama-server', 'llama-cli', 'llama-server.exe', 'llama-cli.exe']:
-                path = os.path.join(cfg_path, name)
-                if os.path.exists(path) and os.access(path, os.X_OK):
-                    return path
-        # If it's a file and executable
-        elif os.path.isfile(cfg_path) and os.access(cfg_path, os.X_OK):
-            return cfg_path
-        # If it's a file but not executable, check for llama-server in same dir
-        elif os.path.isfile(cfg_path):
-            parent = os.path.dirname(cfg_path)
-            for name in ['llama-server', 'llama-cli']:
-                path = os.path.join(parent, name)
-                if os.path.exists(path) and os.access(path, os.X_OK):
-                    return path
-
-    # Check PATH and common locations (including build directories)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    for name in ['llama-server', 'llama-cli']:
-        paths = [
-            os.environ.get('LLAMA_CLI_PATH', ''),
-            shutil.which(name) or '',
-            # Local project llama.cpp build (most common)
-            os.path.join(script_dir, 'llama.cpp', 'build', 'bin', name),
-            os.path.join(script_dir, 'llama.cpp', name),
-            # Relative paths
-            f'./llama.cpp/build/bin/{name}',
-            f'./llama.cpp/{name}',
-            f'./{name}',
-            # Home directory
-            os.path.expanduser(f'~/llama.cpp/build/bin/{name}'),
-            os.path.expanduser(f'~/llama.cpp/{name}'),
-            # System paths
-            f'/usr/local/bin/{name}',
-            f'/opt/homebrew/bin/{name}',
-        ]
-        for p in paths:
-            if p and os.path.exists(p) and os.access(p, os.X_OK):
-                return p
-    return None
-
 def setup_llama():
     """Setup llama.cpp for local inference."""
     console.print("\n[bold cyan]Setting up llama.cpp[/]")
@@ -417,7 +370,7 @@ def setup_ocr():
             return False
         return setup_windows_ocr()
 
-    elif ocr_method in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8"):
+    elif ocr_method in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8"):
         info(f"Model: {cfg.get('ocr_model')}")
         return setup_llama()
 
@@ -439,7 +392,7 @@ def setup_translation():
         return True
 
     elif translate_method == "qwen_vlm":
-        if cfg.get("ocr_method") in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8"):
+        if cfg.get("ocr_method") in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8"):
             info("Using same VLM for OCR and translation")
             return True  # Already set up in OCR step
         else:
@@ -474,13 +427,13 @@ def verify():
     table.add_row("", "")
 
     # OCR
-    ocr_names = {"qwen_vlm": "Qwen VLM", "lfm_vlm": "LFM VL", "ministral_vlm_q4": "Ministral Q4", "ministral_vlm_q8": "Ministral Q8", "oneocr": "OneOCR"}
+    ocr_names = {"qwen_vlm": "Qwen VLM", "lfm_vlm": "LFM VL", "ministral_vlm_q8": "Ministral Q8", "oneocr": "OneOCR"}
     table.add_row("OCR", f"[bold]{ocr_names.get(ocr_method, ocr_method)}[/]")
 
     if ocr_method == "oneocr":
         ocr_ok = os.path.exists(os.path.join('workflow', 'ocr', 'oneocr.dll'))
         table.add_row("  Status", "[green]✓ Ready[/]" if ocr_ok else "[red]✗ Not setup[/]")
-    elif ocr_method in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8"):
+    elif ocr_method in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8"):
         table.add_row("  Model", cfg.get("ocr_model", ""))
 
     # Translation
@@ -490,7 +443,7 @@ def verify():
 
     if translate_method == "cerebras_api":
         table.add_row("  API Key", "[green]✓ Set[/]" if cfg.get("cerebras_api_key") else "[yellow]⚠ Not set[/]")
-    elif translate_method == "qwen_vlm" and ocr_method in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8"):
+    elif translate_method == "qwen_vlm" and ocr_method in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8"):
         table.add_row("  Model", "[dim]Same as OCR[/]")
     elif translate_method in ("qwen_vlm", "hunyuan_mt"):
         table.add_row("  Model", cfg.get("translate_model", ""))
@@ -550,14 +503,10 @@ def verify():
 
 def start_llama_server():
     """Start llama-server for VLM OCR if needed."""
-    cfg = load_config()
-
-    # Check if VLM is needed
-    ocr_method = cfg.get("ocr_method", "qwen_vlm")
-    if ocr_method not in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8"):
+    ocr_method = get_ocr_method()
+    if ocr_method not in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8"):
         return True  # Not needed
 
-    # Find llama-server
     llama = find_llama()
     if not llama:
         warn("llama-server not found - skipping auto-start")
@@ -565,7 +514,7 @@ def start_llama_server():
 
     # Check if already running
     import requests
-    server_url = cfg.get("ocr_server_url", "http://localhost:8080")
+    server_url = get_ocr_server_url()
     try:
         r = requests.get(f"{server_url}/health", timeout=2)
         if r.status_code == 200:
@@ -576,64 +525,33 @@ def start_llama_server():
 
     console.print("\n[bold cyan]Starting llama-server[/]")
 
-    # Get config values
-    model = cfg.get("ocr_model", "Qwen/Qwen3-VL-2B-Instruct-GGUF:Qwen3VL-2B-Instruct-Q8_0.gguf")
-    mmproj = cfg.get("ocr_mmproj", "Qwen/Qwen3-VL-2B-Instruct-GGUF:mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf")
-    context_size = str(cfg.get("llama_context_size", 2048))
-    gpu_layers = str(cfg.get("llama_gpu_layers", 99))
+    model = get_ocr_model()
+    mmproj = get_ocr_mmproj()
 
-    # Parse port from URL
     import re
     port_match = re.search(r':(\d+)$', server_url)
     port = port_match.group(1) if port_match else '8080'
 
     info(f"Model: {model}")
-    info(f"mmproj: {mmproj}")
     info(f"Port: {port}")
 
-    # Create log directory
+    # Download mmproj and build command using centralized functions
+    mmproj_path = download_mmproj(mmproj)
+    if mmproj and not mmproj_path:
+        warn("Failed to download mmproj")
+
     log_dir = os.path.join(os.path.dirname(__file__), '.llama_logs')
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, 'setup_start.log')
 
-    # Download mmproj if needed (llama-server doesn't support -hf for mmproj)
-    mmproj_path = None
-    if mmproj:
-        # Parse HF format: "owner/repo:filename"
-        if ':' in mmproj:
-            repo, filename = mmproj.rsplit(':', 1)
-            cache_dir = os.path.expanduser('~/.cache/llama.cpp')
-            os.makedirs(cache_dir, exist_ok=True)
-            mmproj_path = os.path.join(cache_dir, filename)
-
-            if not os.path.exists(mmproj_path):
-                url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
-                info(f"Downloading mmproj: {filename}")
-                try:
-                    import urllib.request
-                    urllib.request.urlretrieve(url, mmproj_path)
-                    ok(f"Downloaded mmproj to {mmproj_path}")
-                except Exception as e:
-                    warn(f"Failed to download mmproj: {e}")
-                    mmproj_path = None
-            else:
-                info(f"Using cached mmproj: {mmproj_path}")
-
-    # Start the server with live output streaming
     env = os.environ.copy()
     env['LD_LIBRARY_PATH'] = '/usr/local/lib:' + env.get('LD_LIBRARY_PATH', '')
 
     try:
         log_handle = open(log_file, 'w')
-        # Build command with mmproj for VLM models
-        cmd = [llama, '-hf', model, '--port', port, '-c', context_size, '-ngl', gpu_layers]
-        if mmproj_path:
-            cmd.extend(['--mmproj', mmproj_path])
-        # Required for Qwen VL models to work correctly with images
-        cmd.extend(['--image-min-tokens', '1024'])
+        cmd = build_llama_command(llama, model, port, mmproj_path)
         proc = subprocess.Popen(
-            cmd,
-            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             start_new_session=True, bufsize=1, universal_newlines=True
         )
     except Exception as e:

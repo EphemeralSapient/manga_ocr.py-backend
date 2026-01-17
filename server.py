@@ -69,6 +69,7 @@ from config import (
     get_llama_cli_path, get_llama_context_size, get_llama_gpu_layers,
     get_server_port, needs_llama, get_sequential_model_loading, get_streaming_enabled,
     get_ocr_grid_max_cells, get_translation_batch_size,
+    find_llama, download_mmproj, build_llama_command,
 )
 
 # Load configuration
@@ -114,58 +115,6 @@ except ImportError:
     HAS_LOCAL_TRANSLATE = False
 
 
-def _find_llama_server():
-    """Find llama-server executable using config.json llama_cli_path."""
-    import shutil
-
-    llama_cli_path = get_llama_cli_path()
-
-    # 1. Check config.json llama_cli_path
-    if llama_cli_path:
-        # If it's a directory, look for llama-server inside it
-        if os.path.isdir(llama_cli_path):
-            for name in ['llama-server', 'llama-server.exe']:
-                path = os.path.join(llama_cli_path, name)
-                if os.path.exists(path) and os.access(path, os.X_OK):
-                    return path
-        # If it's a file, check if it's llama-server or find it in same dir
-        elif os.path.isfile(llama_cli_path):
-            if 'llama-server' in llama_cli_path:
-                return llama_cli_path
-            parent = os.path.dirname(llama_cli_path)
-            for name in ['llama-server', 'llama-server.exe']:
-                path = os.path.join(parent, name)
-                if os.path.exists(path) and os.access(path, os.X_OK):
-                    return path
-
-    # 2. Check PATH
-    if shutil.which('llama-server'):
-        return shutil.which('llama-server')
-
-    # 3. Check common locations (including build directories)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    paths = [
-        # Local project llama.cpp build (most common)
-        os.path.join(script_dir, 'llama.cpp', 'build', 'bin', 'llama-server'),
-        os.path.join(script_dir, 'llama.cpp', 'llama-server'),
-        # Relative paths
-        './llama.cpp/build/bin/llama-server',
-        './llama.cpp/llama-server',
-        './llama-server',
-        # Home directory
-        os.path.expanduser('~/llama.cpp/build/bin/llama-server'),
-        os.path.expanduser('~/llama.cpp/llama-server'),
-        # System paths
-        '/usr/local/bin/llama-server',
-        '/opt/homebrew/bin/llama-server',
-    ]
-    for path in paths:
-        if os.path.exists(path) and os.access(path, os.X_OK):
-            return path
-
-    return None
-
-
 def _kill_existing_llama_servers():
     """Kill any existing llama-server processes."""
     import subprocess
@@ -191,15 +140,11 @@ def _start_llama_servers():
     """Auto-start llama servers for OCR and translation."""
     import subprocess
 
-    # Kill any existing llama-server processes first
     _kill_existing_llama_servers()
 
-    llama_server = _find_llama_server()
+    llama_server = find_llama()
     if not llama_server:
-        llama_cli_path = get_llama_cli_path()
         print("  llama-server not found, skipping auto-start")
-        if llama_cli_path:
-            print(f"  (llama_cli_path in config: {llama_cli_path})")
         print("  Install llama.cpp or set llama_cli_path in config.json")
         return
 
@@ -211,54 +156,27 @@ def _start_llama_servers():
     log_dir = os.path.join(os.path.dirname(__file__), '.llama_logs')
     os.makedirs(log_dir, exist_ok=True)
 
-    # Get config values
-    context_size = str(get_llama_context_size())
-    gpu_layers = str(get_llama_gpu_layers())
     ocr_model = get_ocr_model()
-    ocr_mmproj = get_ocr_mmproj()
     translate_model = get_translate_model()
+    mmproj_path = download_mmproj(get_ocr_mmproj())
 
-    # Download mmproj if needed (llama-server doesn't support -hf for mmproj)
-    mmproj_path = None
-    if ocr_mmproj and ':' in ocr_mmproj:
-        repo, filename = ocr_mmproj.rsplit(':', 1)
-        cache_dir = os.path.expanduser('~/.cache/llama.cpp')
-        os.makedirs(cache_dir, exist_ok=True)
-        mmproj_path = os.path.join(cache_dir, filename)
-
-        if not os.path.exists(mmproj_path):
-            url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
-            print(f"  Downloading mmproj: {filename}...")
-            try:
-                import urllib.request
-                urllib.request.urlretrieve(url, mmproj_path)
-                print(f"  Downloaded mmproj to {mmproj_path}")
-            except Exception as e:
-                print(f"  Warning: Failed to download mmproj: {e}")
-                mmproj_path = None
-
-    # Start OCR server (port 8080) - always start fresh after killing existing
+    # Start OCR server (port 8080)
     if ocr_model:
         print(f"  Starting OCR server ({ocr_model})...")
-        cmd = [llama_server, '-hf', ocr_model, '--port', '8080', '-c', context_size, '-ngl', gpu_layers]
-        if mmproj_path:
-            cmd.extend(['--mmproj', mmproj_path])
-        # Required for Qwen VL models to work correctly with images
-        cmd.extend(['--image-min-tokens', '1024'])
+        cmd = build_llama_command(llama_server, ocr_model, '8080', mmproj_path)
         with open(os.path.join(log_dir, 'ocr.log'), 'w') as log:
-            subprocess.Popen(
-                cmd,
-                env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
-            )
+            subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
 
     # Start Translation server (port 8081) - only if using local translation
     if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt") and translate_model:
-        # Skip if using same model for OCR and translate
-        if not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm"):
+        if not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm"):
             print(f"  Starting Translation server ({translate_model})...")
+            # Translation doesn't need mmproj
+            ctx = str(get_llama_context_size())
+            ngl = str(get_llama_gpu_layers())
             with open(os.path.join(log_dir, 'translate.log'), 'w') as log:
                 subprocess.Popen(
-                    [llama_server, '-hf', translate_model, '--port', '8081', '-c', context_size, '-ngl', gpu_layers],
+                    [llama_server, '-hf', translate_model, '--port', '8081', '-c', ctx, '-ngl', ngl],
                     env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
                 )
 
@@ -267,8 +185,8 @@ def _start_llama_servers():
         import time
         print("  Waiting for servers to start (may download models)...")
         for i in range(60):
-            ocr_ok = check_vlm_server() if OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8") else True
-            trans_ok = check_translate_server() if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt") and not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm") else True
+            ocr_ok = check_vlm_server() if OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8") else True
+            trans_ok = check_translate_server() if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt") and not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm") else True
             if ocr_ok and trans_ok:
                 break
             time.sleep(1)
@@ -340,47 +258,23 @@ class SequentialModelManager:
     def start_ocr_server(self):
         """Start OCR llama-server (kills translate server if running)."""
         with self._get_lock():
-            # Kill translate server first to free VRAM
             if self._translate_process is not None:
                 print("  [Sequential] Stopping translation server to free VRAM...")
                 self._kill_process(self._translate_process)
                 self._translate_process = None
-                time.sleep(1)  # Wait for VRAM to be released
+                time.sleep(1)
 
-            # Check if OCR server already running
             if check_vlm_server():
                 return True
 
-            llama_server = _find_llama_server()
+            llama_server = find_llama()
             if not llama_server:
                 print("  [Sequential] llama-server not found")
                 return False
 
-            # Get config
-            context_size = str(get_llama_context_size())
-            gpu_layers = str(get_llama_gpu_layers())
             ocr_model = get_ocr_model()
-            ocr_mmproj = get_ocr_mmproj()
+            mmproj_path = download_mmproj(get_ocr_mmproj())
 
-            # Download mmproj if needed
-            mmproj_path = None
-            if ocr_mmproj and ':' in ocr_mmproj:
-                repo, filename = ocr_mmproj.rsplit(':', 1)
-                cache_dir = os.path.expanduser('~/.cache/llama.cpp')
-                os.makedirs(cache_dir, exist_ok=True)
-                mmproj_path = os.path.join(cache_dir, filename)
-
-                if not os.path.exists(mmproj_path):
-                    url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
-                    print(f"  [Sequential] Downloading mmproj: {filename}...")
-                    try:
-                        import urllib.request
-                        urllib.request.urlretrieve(url, mmproj_path)
-                    except Exception as e:
-                        print(f"  Warning: Failed to download mmproj: {e}")
-                        mmproj_path = None
-
-            # Start server
             print(f"  [Sequential] Starting OCR server ({ocr_model})...")
             env = os.environ.copy()
             env['LD_LIBRARY_PATH'] = '/usr/local/lib:' + env.get('LD_LIBRARY_PATH', '')
@@ -388,19 +282,14 @@ class SequentialModelManager:
             log_dir = os.path.join(os.path.dirname(__file__), '.llama_logs')
             os.makedirs(log_dir, exist_ok=True)
 
-            cmd = [llama_server, '-hf', ocr_model, '--port', '8080', '-c', context_size, '-ngl', gpu_layers]
-            if mmproj_path:
-                cmd.extend(['--mmproj', mmproj_path])
-            cmd.extend(['--image-min-tokens', '1024'])
+            cmd = build_llama_command(llama_server, ocr_model, '8080', mmproj_path)
 
             import subprocess
             with open(os.path.join(log_dir, 'ocr_sequential.log'), 'w') as log:
                 self._ocr_process = subprocess.Popen(
-                    cmd,
-                    env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+                    cmd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
                 )
 
-            # Wait for server to be ready
             if self._wait_for_server(get_ocr_server_url(), timeout=120, check_fn=check_vlm_server):
                 print(f"  [Sequential] OCR server ready")
                 return True
@@ -430,12 +319,11 @@ class SequentialModelManager:
     def start_translate_server(self):
         """Start translation llama-server (kills OCR server if running)."""
         with self._get_lock():
-            # Kill OCR server first to free VRAM
             if self._ocr_process is not None:
                 print("  [Sequential] Stopping OCR server to free VRAM...")
                 self._kill_process(self._ocr_process)
                 self._ocr_process = None
-                time.sleep(1)  # Wait for VRAM to be released
+                time.sleep(1)
 
             # Also kill any orphaned OCR server
             import subprocess
@@ -448,21 +336,18 @@ class SequentialModelManager:
             except:
                 pass
 
-            # Check if translate server already running
             if check_translate_server():
                 return True
 
-            llama_server = _find_llama_server()
+            llama_server = find_llama()
             if not llama_server:
                 print("  [Sequential] llama-server not found")
                 return False
 
-            # Get config
-            context_size = str(get_llama_context_size())
-            gpu_layers = str(get_llama_gpu_layers())
             translate_model = get_translate_model()
+            ctx = str(get_llama_context_size())
+            ngl = str(get_llama_gpu_layers())
 
-            # Start server
             print(f"  [Sequential] Starting translation server ({translate_model})...")
             env = os.environ.copy()
             env['LD_LIBRARY_PATH'] = '/usr/local/lib:' + env.get('LD_LIBRARY_PATH', '')
@@ -473,7 +358,7 @@ class SequentialModelManager:
             import subprocess
             with open(os.path.join(log_dir, 'translate_sequential.log'), 'w') as log:
                 self._translate_process = subprocess.Popen(
-                    [llama_server, '-hf', translate_model, '--port', '8081', '-c', context_size, '-ngl', gpu_layers],
+                    [llama_server, '-hf', translate_model, '--port', '8081', '-c', ctx, '-ngl', ngl],
                     env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
                 )
 
@@ -583,7 +468,7 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
     print(f"  [Detect] {len(bubbles)} bubbles in {detect_time:.0f}ms")
 
     # Sequential model loading: start OCR server on demand
-    uses_vlm_ocr = OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8")
+    uses_vlm_ocr = OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8")
     if SEQUENTIAL_MODEL_LOADING and uses_vlm_ocr and HAS_VLM_OCR:
         seq_mgr = get_sequential_manager()
         seq_mgr.start_ocr_server()
@@ -826,7 +711,7 @@ def process_images_label2(images: List[Image.Image], api_key: str = None, output
     print(f"  Detected {len(bubbles_l1)} text bubbles, {len(bubbles_l2)} text-free regions in {detect_time:.0f}ms")
 
     # Sequential model loading: start OCR server on demand
-    uses_vlm_ocr = OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8")
+    uses_vlm_ocr = OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8")
     if SEQUENTIAL_MODEL_LOADING and uses_vlm_ocr and HAS_VLM_OCR:
         seq_mgr = get_sequential_manager()
         seq_mgr.start_ocr_server()
@@ -1457,7 +1342,7 @@ def translate_label1_stream():
             stats["bubbles_detected"] = len(bubbles)
 
             # Sequential mode: start OCR server
-            uses_vlm_ocr = OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8")
+            uses_vlm_ocr = OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8")
             if SEQUENTIAL_MODEL_LOADING and uses_vlm_ocr and HAS_VLM_OCR:
                 seq_mgr = get_sequential_manager()
                 seq_mgr.start_ocr_server()
@@ -1731,7 +1616,7 @@ if __name__ == '__main__':
     print("")
 
     # Show VLM OCR availability
-    llama_server_path = _find_llama_server()
+    llama_server_path = find_llama()
     if HAS_VLM_OCR or llama_server_path:
         print(f"VLM OCR: Available ({llama_server_path})")
     else:
@@ -1753,9 +1638,9 @@ if __name__ == '__main__':
         print("\nChecking llama servers...")
         _start_llama_servers()
         ocr_ok = check_vlm_server()
-        trans_ok = check_translate_server() if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt") and not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm") else True
+        trans_ok = check_translate_server() if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt") and not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm") else True
         print(f"  OCR Server (8080): {'Running' if ocr_ok else 'Not running'}")
-        if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt") and not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm"):
+        if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt") and not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm"):
             print(f"  Translate Server (8081): {'Running' if trans_ok else 'Not running'}")
     elif needs_llama() and SEQUENTIAL_MODEL_LOADING:
         # Sequential mode: servers started on demand per request
@@ -1772,7 +1657,7 @@ if __name__ == '__main__':
         mmproj_note = f"\n  # Download mmproj first: curl -L -o mmproj.gguf https://huggingface.co/{mmproj.replace(':', '/resolve/main/')}" if mmproj and ':' in mmproj else ""
         mmproj_flag = " --mmproj mmproj.gguf" if mmproj else ""
         print(f"  {llama_server} -hf {get_ocr_model()}{mmproj_flag} --port 8080 -c {ctx} -ngl {ngl}{mmproj_note}")
-        if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt") and not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q4", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm"):
+        if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt") and not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm"):
             print(f"  {llama_server} -hf {get_translate_model()} --port 8081 -c {ctx} -ngl {ngl}")
 
     # Pre-load detector only (inpainter loaded on-demand for label2)
