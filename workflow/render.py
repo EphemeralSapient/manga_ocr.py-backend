@@ -142,8 +142,8 @@ def render_text_on_image(
         if translated == "[NO TEXT]":
             continue
 
-        # Always clean text in L1 bubbles (don't skip even if L2 was inpainted)
-        # L1 bubbles always need text removed - use text_seg for pixel-level or bbox fallback
+        # Clean text in bubbles - use text_seg for pixel-level or bbox fallback
+        # Note: L2 bubbles are rendered in a separate call with text_segmenter=None (skip clearing)
         bx1, by1, bx2, by2 = bubble_box
 
         if full_page_mask is not None:
@@ -155,8 +155,8 @@ def render_text_on_image(
             if np.any(mask_region > 30):
                 img_array[by1:by2, bx1:bx2][mask_region > 30] = 255
 
-        else:
-            # Fallback: bbox-based white fill
+        elif text_segmenter is not None:
+            # Fallback: bbox-based white fill (only if text_segmenter was provided but mask failed)
             margin = 3
             safe_bx1, safe_by1 = bx1 + margin, by1 + margin
             safe_bx2, safe_by2 = bx2 - margin, by2 - margin
@@ -167,6 +167,7 @@ def render_text_on_image(
                            min(tx2, safe_bx2), min(ty2, safe_by2)]
                 if clipped[2] > clipped[0] and clipped[3] > clipped[1]:
                     draw.rectangle(clipped, fill="white")
+        # else: text_segmenter is None = L2 regions already inpainted, skip clearing
 
     # Convert back from array
     img = Image.fromarray(img_array)

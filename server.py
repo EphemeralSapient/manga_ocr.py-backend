@@ -494,58 +494,32 @@ def get_text_segmenter_instance() -> TextSegmenter:
 
 def inpaint_image(img_array: np.ndarray, bubbles: List[Dict], inpainter: Inpainter,
                   text_segmenter: TextSegmenter = None, verbose: bool = False) -> Tuple[np.ndarray, Dict]:
-    """Inpaint text regions in image (label2 regions) using pixel-level text segmentation.
+    """Inpaint L2 regions using AOT-GAN on the whole bbox.
 
     Args:
         img_array: Input image as numpy array
         bubbles: List of bubble dicts with 'bubble_box'
-        inpainter: Inpainter instance
-        text_segmenter: Optional TextSegmenter for pixel-level masks (better quality)
-        verbose: If True, log each inpaint operation
+        inpainter: Inpainter instance for AOT-GAN inpainting
+        text_segmenter: Unused for L2 (kept for API compatibility)
+        verbose: If True, log each operation
 
     Returns:
         Tuple of (inpainted image array, stats dict)
     """
     inpainter.reset_stats()
-    use_text_seg = text_segmenter is not None and TEXT_SEG_ENABLED
 
     if verbose:
-        mode_str = "pixel-level text_seg" if use_text_seg else "bbox"
-        print(f"  [Inpaint L2] Processing {len(bubbles)} regions ({mode_str})...")
-
-    if use_text_seg:
-        text_segmenter.reset_stats()
+        print(f"  [Inpaint L2] Processing {len(bubbles)} regions (AOT bbox)...")
 
     for i, bubble in enumerate(bubbles):
         bbox = bubble["bubble_box"]
-
-        if use_text_seg:
-            # Extract region for text segmentation
-            x1, y1, x2, y2 = bbox
-            region = img_array[y1:y2, x1:x2]
-
-            if region.size > 0:
-                # Get pixel-level text mask
-                text_mask = text_segmenter(region, verbose=False)
-
-                if np.any(text_mask > 127):
-                    # Inpaint with pixel-level mask
-                    coords, result = inpainter.inpaint_with_mask(img_array, bbox, text_mask, verbose=verbose)
-                    img_array[coords[0]:coords[1], coords[2]:coords[3]] = result
-                elif verbose:
-                    print(f"    [Inpaint L2] region {i+1}: skipped (no text detected)")
-        else:
-            # Fallback to bbox-based inpainting
-            coords, result = inpainter(img_array, bbox, verbose=verbose)
-            img_array[coords[0]:coords[1], coords[2]:coords[3]] = result
+        coords, result = inpainter(img_array, bbox, verbose=verbose)
+        img_array[coords[0]:coords[1], coords[2]:coords[3]] = result
 
     stats = inpainter.get_stats()
-    if use_text_seg:
-        stats['text_seg'] = text_segmenter.get_stats()
-        stats['text_seg_enabled'] = True
 
     if verbose:
-        print(f"  [Inpaint L2] Done: {stats['count']} regions, {stats['total_ms']}ms total, {stats['avg_ms']}ms avg")
+        print(f"  [Inpaint L2] Done: {stats['count']} regions, {stats['total_ms']}ms total")
 
     return img_array, stats
 
@@ -581,27 +555,31 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
     inpaint_future = None
     inpainted_images = None
 
+    # Track L2 data for later rendering (kept separate from L1)
+    l2_data = {}
+    l2_ocr_data = {}  # Separate OCR data for L2
+
     if inpaint_background and output_type != "text_only":
-        # Detect label2 regions for inpainting
+        # Detect label2 regions for inpainting + OCR/translate
         bubbles_l2, detect_time_l2 = detect_all(session, images, mode, target_label=2)
         stats["label2_detected"] = len(bubbles_l2)
         detect_time += detect_time_l2
         print(f"  [Detect] {len(bubbles)} bubbles (L1) + {len(bubbles_l2)} text-free regions (L2) in {detect_time:.0f}ms")
 
+        # Build l2_data for inpainting (DO NOT mix with L1 bubbles)
+        for b in bubbles_l2:
+            page_idx = b['page_idx']
+            if page_idx not in l2_data:
+                l2_data[page_idx] = []
+            l2_data[page_idx].append({
+                'bubble_box': list(b['box']),
+                'bubble_idx': b['bubble_idx']
+            })
+
         # Start inpainting in background (runs in parallel with OCR/translate)
         if bubbles_l2:
             inpainter = get_inpainter()
             text_seg = get_text_segmenter_instance() if TEXT_SEG_ENABLED else None
-
-            # Build l2_data by page
-            l2_data = {}
-            for b in bubbles_l2:
-                page_idx = b['page_idx']
-                if page_idx not in l2_data:
-                    l2_data[page_idx] = []
-                l2_data[page_idx].append({
-                    'bubble_box': list(b['box'])
-                })
 
             def do_inpainting():
                 t_start = time.time()
@@ -690,19 +668,64 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
     for page_idx in ocr_data:
         ocr_data[page_idx].sort(key=lambda x: x['idx'])
 
+    # === L2 OCR (separate from L1) ===
+    l2_ocr_result = None
+    l2_positions = None
+    if bubbles_l2 and inpaint_background:
+        t0_l2 = time.time()
+        if HAS_VLM_OCR:
+            print(f"  [OCR L2] Using VLM for {len(bubbles_l2)} text-free regions...")
+            l2_ocr_result, l2_positions, _ = run_ocr_on_bubbles(bubbles_l2, translate=False)
+        else:
+            l2_grid, l2_positions = grid_bubbles(bubbles_l2)
+            l2_ocr_result = run_ocr(l2_grid)
+        l2_ocr_time = int((time.time() - t0_l2) * 1000)
+        print(f"  [OCR L2] {l2_ocr_result.get('line_count', 0)} lines in {l2_ocr_time}ms")
+        stats["ocr_l2_ms"] = l2_ocr_time
+        stats["ocr_l2_lines"] = l2_ocr_result.get('line_count', 0)
+
+        # Map L2 OCR to bubbles
+        l2_bubble_texts = map_ocr(l2_ocr_result, l2_positions)
+        l2_bubble_map = {(b['page_idx'], b['bubble_idx']): b for b in bubbles_l2}
+
+        for key, text_items in l2_bubble_texts.items():
+            page_idx, bubble_idx = key
+            b = l2_bubble_map.get(key)
+            if b:
+                if page_idx not in l2_ocr_data:
+                    l2_ocr_data[page_idx] = []
+                l2_ocr_data[page_idx].append({
+                    'idx': bubble_idx,
+                    'bubble_box': list(b['box']),
+                    'texts': text_items
+                })
+
     # Extract texts for translation (or use already-translated texts)
     all_texts = []
-    text_mapping = []  # (page_idx, bubble_idx)
+    text_mapping = []  # (page_idx, bubble_idx, is_l2)
     is_already_translated = ocr_result.get('translated', False)
 
+    # L1 texts
     for page_idx, page_bubbles in sorted(ocr_data.items()):
         for bubble in page_bubbles:
             merged = "".join([t['text'] for t in bubble['texts']])
             if merged.strip():
                 all_texts.append(merged.strip())
-                text_mapping.append((page_idx, bubble['idx']))
+                text_mapping.append((page_idx, bubble['idx'], False))  # is_l2=False
+
+    l1_text_count = len(all_texts)
+
+    # L2 texts (separate batch tracking)
+    for page_idx, page_bubbles in sorted(l2_ocr_data.items()):
+        for bubble in page_bubbles:
+            merged = "".join([t['text'] for t in bubble['texts']])
+            if merged.strip():
+                all_texts.append(merged.strip())
+                text_mapping.append((page_idx, bubble['idx'], True))  # is_l2=True
 
     stats["texts_to_translate"] = len(all_texts)
+    stats["texts_l1"] = l1_text_count
+    stats["texts_l2"] = len(all_texts) - l1_text_count
 
     # Sequential model loading: start translate server if using local LLM
     uses_local_translate = translate_local and HAS_LOCAL_TRANSLATE and TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt")
@@ -762,12 +785,19 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
         seq_mgr = get_sequential_manager()
         seq_mgr.stop_translate_server()
 
-    # Build translation lookup per page
-    translation_data = {}
-    for i, (page_idx, bubble_idx) in enumerate(text_mapping):
-        if page_idx not in translation_data:
-            translation_data[page_idx] = {}
-        translation_data[page_idx][bubble_idx] = translations[i] if i < len(translations) else "[MISSING]"
+    # Build translation lookup per page (separate L1 and L2)
+    translation_data = {}  # L1 translations
+    l2_translation_data = {}  # L2 translations
+    for i, (page_idx, bubble_idx, is_l2) in enumerate(text_mapping):
+        trans_text = translations[i] if i < len(translations) else "[MISSING]"
+        if is_l2:
+            if page_idx not in l2_translation_data:
+                l2_translation_data[page_idx] = {}
+            l2_translation_data[page_idx][bubble_idx] = trans_text
+        else:
+            if page_idx not in translation_data:
+                translation_data[page_idx] = {}
+            translation_data[page_idx][bubble_idx] = trans_text
 
     # Handle different output types
     if output_type == "text_only":
@@ -874,10 +904,18 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
         output_images = []
         for page_idx, img in enumerate(source_images):
             img_copy = img.copy()
+
+            # Step 1: Render L1 bubbles (with text_seg clearing)
             page_bubbles = ocr_data.get(page_idx, [])
             page_translations = translation_data.get(page_idx, {})
-            # Use text_seg_l1 for pixel-level text cleaning (fills with white)
             rendered = render_text_on_image(img_copy, page_bubbles, page_translations, use_inpaint=use_inpaint, text_segmenter=text_seg_l1)
+
+            # Step 2: Render L2 translations (no clearing - already inpainted)
+            page_l2_bubbles = l2_ocr_data.get(page_idx, [])
+            page_l2_translations = l2_translation_data.get(page_idx, {})
+            if page_l2_bubbles and page_l2_translations:
+                rendered = render_text_on_image(rendered, page_l2_bubbles, page_l2_translations, use_inpaint=True, text_segmenter=None)
+
             output_images.append(rendered)
 
         render_time = int((time.time() - t0) * 1000)
