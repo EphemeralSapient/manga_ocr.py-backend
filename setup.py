@@ -655,17 +655,32 @@ except Exception as e:
 
 # Try inpainter warmup too (optional, may use significant VRAM)
 try:
+    import numpy as np
     from workflow import create_inpainter
     inpainter = create_inpainter()
     print("WARMUP:inpainter_loaded")
 
-    # Run inpaint on small demo
-    small = Image.new('RGB', (256, 256), (255, 255, 255))
-    mask = Image.new('L', (256, 256), 0)
-    inpainter.inpaint(small, mask)
+    # Run inpaint on small demo (inpainter takes img array and bbox)
+    small = np.ones((256, 256, 3), dtype=np.uint8) * 255
+    bbox = [50, 50, 150, 150]  # x1, y1, x2, y2
+    inpainter(small, bbox)
     print("WARMUP:inpainter_done")
 except Exception as e:
     print(f"WARMUP:inpainter_skip:{e}")
+
+# Try text segmentation warmup (TensorRT cached)
+try:
+    import numpy as np
+    from workflow import create_text_segmenter
+    text_seg = create_text_segmenter()
+    print("WARMUP:textseg_loaded")
+
+    # Run segmentation on small demo
+    demo_img = np.ones((512, 512, 3), dtype=np.uint8) * 255
+    text_seg(demo_img)
+    print("WARMUP:textseg_done")
+except Exception as e:
+    print(f"WARMUP:textseg_skip:{e}")
 
 print("WARMUP:complete")
 '''
@@ -686,6 +701,10 @@ print("WARMUP:complete")
             ok("Inpainter engine cached")
         elif 'WARMUP:inpainter_skip' in output:
             info("Inpainter will cache on first use")
+        if 'WARMUP:textseg_done' in output:
+            ok("Text segmentation engine cached")
+        elif 'WARMUP:textseg_skip' in output:
+            info("Text segmentation will cache on first use")
         if 'WARMUP:complete' in output:
             ok("TensorRT engines ready - server will start faster")
     else:

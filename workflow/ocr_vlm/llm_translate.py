@@ -276,7 +276,7 @@ class LlmTranslator:
 
         return ''.join(output_chunks), False, None
 
-    def _translate_batch(self, texts, source_lang, target_lang, max_retries=2):
+    def _translate_batch(self, texts, source_lang, target_lang, max_retries=4):
         """Translate a batch of texts with retry logic using HunyuanMT prompt format."""
         if not texts:
             return {'translations': []}

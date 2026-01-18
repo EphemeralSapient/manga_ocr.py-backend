@@ -54,6 +54,7 @@ import threading
 from workflow import detect_mode, create_session, detect_all, CROP_PADDING
 from workflow import grid_bubbles, run_ocr, run_ocr_on_bubbles, map_ocr, reset_vlm_ocr, HAS_LFM_OCR, HAS_VLM_OCR
 from workflow import create_inpainter, Inpainter
+from workflow import create_text_segmenter, TextSegmenter
 from workflow import render_text_on_image
 from workflow import translate_texts
 
@@ -70,6 +71,7 @@ from config import (
     get_server_port, needs_llama, get_sequential_model_loading, get_streaming_enabled,
     get_ocr_grid_max_cells, get_translation_batch_size,
     find_llama, download_mmproj, build_llama_command,
+    get_text_seg_enabled, get_text_seg_model, get_text_seg_input_size,
 )
 
 # Load configuration
@@ -453,6 +455,10 @@ app = Flask(__name__)
 _detector_session = None
 _detector_mode = None
 _inpainter = None
+_text_segmenter = None
+
+# Text segmentation config
+TEXT_SEG_ENABLED = get_text_seg_enabled()
 
 
 def get_detector():
@@ -472,38 +478,99 @@ def get_inpainter() -> Inpainter:
     return _inpainter
 
 
+def get_text_segmenter_instance() -> TextSegmenter:
+    """Lazy load text segmenter model."""
+    global _text_segmenter
+    if _text_segmenter is None:
+        model_path = get_text_seg_model()
+        input_size = get_text_seg_input_size()
+        _text_segmenter = create_text_segmenter(model_path, input_size)
+    return _text_segmenter
 
 
 
 
-def inpaint_image(img_array: np.ndarray, bubbles: List[Dict], inpainter: Inpainter) -> np.ndarray:
-    """Inpaint text regions in image."""
-    for bubble in bubbles:
-        coords, result = inpainter(img_array, bubble["bubble_box"])
+
+
+def inpaint_image(img_array: np.ndarray, bubbles: List[Dict], inpainter: Inpainter,
+                  verbose: bool = False) -> Tuple[np.ndarray, Dict]:
+    """Inpaint text regions in image (label2 regions).
+
+    Args:
+        img_array: Input image as numpy array
+        bubbles: List of bubble dicts with 'bubble_box'
+        inpainter: Inpainter instance
+        verbose: If True, log each inpaint operation
+
+    Returns:
+        Tuple of (inpainted image array, stats dict)
+    """
+    inpainter.reset_stats()
+    if verbose:
+        print(f"  [Inpaint L2] Processing {len(bubbles)} regions...")
+
+    for i, bubble in enumerate(bubbles):
+        coords, result = inpainter(img_array, bubble["bubble_box"], verbose=verbose)
         img_array[coords[0]:coords[1], coords[2]:coords[3]] = result
-    return img_array
+
+    stats = inpainter.get_stats()
+    if verbose:
+        print(f"  [Inpaint L2] Done: {stats['count']} regions, {stats['total_ms']}ms total, {stats['avg_ms']}ms avg")
+
+    return img_array, stats
 
 
-def inpaint_ocr_bboxes(img: Image.Image, bubbles: List[Dict], inpainter: Inpainter) -> Image.Image:
-    """Inpaint OCR text bboxes within bubbles (replaces white-out).
+def inpaint_ocr_bboxes(img: Image.Image, bubbles: List[Dict], inpainter: Inpainter,
+                       text_segmenter: TextSegmenter = None, verbose: bool = False) -> Tuple[Image.Image, Dict]:
+    """Inpaint OCR text bboxes within bubbles using pixel-level text segmentation.
 
     Args:
         img: PIL Image to inpaint
         bubbles: List of bubble dicts with 'texts' containing OCR bboxes
         inpainter: Inpainter instance
+        text_segmenter: Optional TextSegmenter for pixel-level masks (better quality)
+        verbose: If True, log each inpaint operation
 
     Returns:
-        Inpainted PIL Image
+        Tuple of (Inpainted PIL Image, stats dict)
     """
+    import cv2
+
     img_array = np.array(img)
+    inpainter.reset_stats()
+
+    total_text_regions = sum(len(b.get('texts', [])) for b in bubbles)
+    use_text_seg = text_segmenter is not None and TEXT_SEG_ENABLED
+
+    if verbose:
+        mode_str = "pixel-level text_seg" if use_text_seg else "bbox"
+        print(f"  [Inpaint L1] Processing {len(bubbles)} bubbles, {total_text_regions} text regions ({mode_str})...")
+
+    if use_text_seg:
+        text_segmenter.reset_stats()
 
     for bubble in bubbles:
         texts = bubble.get('texts', [])
+        if not texts:
+            continue
+
         bubble_box = bubble.get('bubble_box', [0, 0, img.width, img.height])
         bx1, by1, bx2, by2 = bubble_box
         margin = 3
         safe_bx1, safe_by1 = bx1 + margin, by1 + margin
         safe_bx2, safe_by2 = bx2 - margin, by2 - margin
+
+        # Get text segmentation mask for the entire bubble region (once per bubble)
+        bubble_mask = None
+        if use_text_seg:
+            # Extract bubble region for segmentation (BGR for OpenCV compatibility)
+            bubble_region = img_array[by1:by2, bx1:bx2]
+            if bubble_region.size > 0:
+                # Run text segmentation on bubble region
+                bubble_mask = text_segmenter(bubble_region, verbose=False)
+                if verbose:
+                    mask_pixels = int(np.sum(bubble_mask > 127))
+                    print(f"    [TextSeg] bubble {bubble.get('idx', '?')}: {bx2-bx1}x{by2-by1}px, {mask_pixels} text pixels")
 
         for text_item in texts:
             tx1, ty1, tx2, ty2 = text_item['bbox']
@@ -511,11 +578,47 @@ def inpaint_ocr_bboxes(img: Image.Image, bubbles: List[Dict], inpainter: Inpaint
             clipped = [max(tx1, safe_bx1), max(ty1, safe_by1),
                       min(tx2, safe_bx2), min(ty2, safe_by2)]
             if clipped[2] > clipped[0] and clipped[3] > clipped[1]:
-                # Inpaint this text bbox
-                coords, result = inpainter(img_array, clipped)
-                img_array[coords[0]:coords[1], coords[2]:coords[3]] = result
+                if use_text_seg and bubble_mask is not None:
+                    # Extract the text mask for this specific text bbox
+                    # Convert from image coords to bubble-relative coords
+                    rel_x1 = clipped[0] - bx1
+                    rel_y1 = clipped[1] - by1
+                    rel_x2 = clipped[2] - bx1
+                    rel_y2 = clipped[3] - by1
 
-    return Image.fromarray(img_array)
+                    # Ensure bounds are valid
+                    rel_x1 = max(0, rel_x1)
+                    rel_y1 = max(0, rel_y1)
+                    rel_x2 = min(bubble_mask.shape[1], rel_x2)
+                    rel_y2 = min(bubble_mask.shape[0], rel_y2)
+
+                    if rel_x2 > rel_x1 and rel_y2 > rel_y1:
+                        # Extract pixel mask for this text region
+                        text_mask = bubble_mask[rel_y1:rel_y2, rel_x1:rel_x2]
+
+                        # Only inpaint if there are actual text pixels in this region
+                        if np.any(text_mask > 127):
+                            # Inpaint with pixel-level mask
+                            coords, result = inpainter.inpaint_with_mask(
+                                img_array, clipped, text_mask, verbose=verbose
+                            )
+                            img_array[coords[0]:coords[1], coords[2]:coords[3]] = result
+                        elif verbose:
+                            print(f"    [Inpaint] skipped empty mask region")
+                else:
+                    # Fallback to bbox-based inpainting
+                    coords, result = inpainter(img_array, clipped, verbose=verbose)
+                    img_array[coords[0]:coords[1], coords[2]:coords[3]] = result
+
+    stats = inpainter.get_stats()
+    if use_text_seg:
+        stats['text_seg'] = text_segmenter.get_stats()
+        stats['text_seg_enabled'] = True
+
+    if verbose:
+        print(f"  [Inpaint L1] Done: {stats['count']} regions, {stats['total_ms']}ms total, {stats['avg_ms']}ms avg")
+
+    return Image.fromarray(img_array), stats
 
 
 def process_images_label1(images: List[Image.Image], api_key: str = None, output_type: str = "full_page",
@@ -569,13 +672,17 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
             def do_inpainting():
                 t_start = time.time()
                 inpainted = []
+                total_regions = 0
                 for page_idx, img in enumerate(images):
                     img_array = np.array(img)
                     page_l2 = l2_data.get(page_idx, [])
                     if page_l2:
-                        img_array = inpaint_image(img_array, page_l2, inpainter)
+                        img_array, page_stats = inpaint_image(img_array, page_l2, inpainter, verbose=False)
+                        total_regions += page_stats.get('count', 0)
                     inpainted.append(Image.fromarray(img_array))
-                return inpainted, int((time.time() - t_start) * 1000)
+                elapsed_ms = int((time.time() - t_start) * 1000)
+                print(f"  [Inpaint L2] {total_regions} regions in {elapsed_ms}ms")
+                return inpainted, elapsed_ms
 
             # Start inpainting in background thread (non-blocking)
             _inpaint_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -763,15 +870,19 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
         if use_inpaint and inpainted_images:
             t_l1 = time.time()
             inpainter = get_inpainter()
+            text_seg = get_text_segmenter_instance() if TEXT_SEG_ENABLED else None
             final_images = []
+            total_regions = 0
             for page_idx, img in enumerate(inpainted_images):
                 page_bubbles = ocr_data.get(page_idx, [])
                 if page_bubbles:
-                    img = inpaint_ocr_bboxes(img, page_bubbles, inpainter)
+                    img, page_stats = inpaint_ocr_bboxes(img, page_bubbles, inpainter, text_seg, verbose=False)
+                    total_regions += page_stats.get('count', 0)
                 final_images.append(img)
             inpaint_l1_ms = int((time.time() - t_l1) * 1000)
             stats["inpaint_l1_ms"] = inpaint_l1_ms
-            print(f"  [Inpaint L1] Completed OCR text areas in {inpaint_l1_ms}ms")
+            stats["inpaint_l1_regions"] = total_regions
+            print(f"  [Inpaint L1] {total_regions} text regions in {inpaint_l1_ms}ms")
             source_images = final_images
         else:
             source_images = inpainted_images if use_inpaint else images
@@ -839,15 +950,19 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
         if use_inpaint and inpainted_images:
             t_l1 = time.time()
             inpainter = get_inpainter()
+            text_seg = get_text_segmenter_instance() if TEXT_SEG_ENABLED else None
             final_images = []
+            total_regions = 0
             for page_idx, img in enumerate(inpainted_images):
                 page_bubbles = ocr_data.get(page_idx, [])
                 if page_bubbles:
-                    img = inpaint_ocr_bboxes(img, page_bubbles, inpainter)
+                    img, page_stats = inpaint_ocr_bboxes(img, page_bubbles, inpainter, text_seg, verbose=False)
+                    total_regions += page_stats.get('count', 0)
                 final_images.append(img)
             inpaint_l1_ms = int((time.time() - t_l1) * 1000)
             stats["inpaint_l1_ms"] = inpaint_l1_ms
-            print(f"  [Inpaint L1] Completed OCR text areas in {inpaint_l1_ms}ms")
+            stats["inpaint_l1_regions"] = total_regions
+            print(f"  [Inpaint L1] {total_regions} text regions in {inpaint_l1_ms}ms")
             source_images = final_images
         else:
             source_images = inpainted_images if use_inpaint else images
@@ -993,12 +1108,17 @@ def process_images_label2(images: List[Image.Image], api_key: str = None, output
     # For modes that need images, run inpainting and translation
     def do_inpainting():
         inpainted = []
+        total_regions = 0
+        t_start = time.time()
         for page_idx, img in enumerate(images):
             img_array = np.array(img)
             page_l2 = l2_data.get(page_idx, [])
             if page_l2:
-                img_array = inpaint_image(img_array, page_l2, inpainter)
+                img_array, page_stats = inpaint_image(img_array, page_l2, inpainter, verbose=False)
+                total_regions += page_stats.get('count', 0)
             inpainted.append(Image.fromarray(img_array))
+        elapsed_ms = int((time.time() - t_start) * 1000)
+        print(f"  [Inpaint L2] {total_regions} regions in {elapsed_ms}ms")
         return inpainted
 
     def do_translation():

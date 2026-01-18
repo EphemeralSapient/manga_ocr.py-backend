@@ -407,7 +407,7 @@ class VlmOCR:
 
         return ''.join(output_chunks), False, None
 
-    def run(self, image, positions=None, grid_info=None, translate=False, max_retries=2):
+    def run(self, image, positions=None, grid_info=None, translate=False, max_retries=4):
         """Run OCR on image via llama-server API."""
         t0 = time.time()
 

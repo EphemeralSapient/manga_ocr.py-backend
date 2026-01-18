@@ -35,6 +35,14 @@ from .inpaint import (
     Inpainter,
 )
 
+# Text Segmentation
+from .text_seg import (
+    create_text_segmenter,
+    get_text_segmenter,
+    reset_text_segmenter,
+    TextSegmenter,
+)
+
 # Rendering
 from .render import (
     render_text_on_image,
@@ -67,6 +75,8 @@ __all__ = [
     'grid_bubbles', 'run_ocr', 'run_ocr_on_bubbles', 'map_ocr', 'reset_vlm_ocr', 'OCR_URL', 'HAS_LFM_OCR', 'HAS_VLM_OCR',
     # Inpainting
     'create_inpainter', 'Inpainter',
+    # Text Segmentation
+    'create_text_segmenter', 'get_text_segmenter', 'reset_text_segmenter', 'TextSegmenter',
     # Rendering
     'render_text_on_image', 'fit_text', 'get_font',
     # Translation
