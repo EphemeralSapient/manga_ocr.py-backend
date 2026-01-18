@@ -61,7 +61,8 @@ def get_input_images():
     return filtered
 
 
-def send_request(endpoint: str, image_paths: list, ocr_translate: bool = False, translate_local: bool = False) -> dict:
+def send_request(endpoint: str, image_paths: list, ocr_translate: bool = False,
+                 translate_local: bool = False, inpaint_background: bool = True) -> dict:
     """Send images to server and return response."""
     url = f"{SERVER_URL}{endpoint}"
 
@@ -75,14 +76,18 @@ def send_request(endpoint: str, image_paths: list, ocr_translate: bool = False, 
         data['ocr_translate'] = 'true'
     if translate_local:
         data['translate_local'] = 'true'
+    # AOT inpainting (default True)
+    data['inpaint_background'] = 'true' if inpaint_background else 'false'
 
     try:
+        mode_parts = []
         if ocr_translate:
-            mode_str = " (ocr_translate)"
+            mode_parts.append("ocr_translate")
         elif translate_local:
-            mode_str = " (translate_local)"
-        else:
-            mode_str = ""
+            mode_parts.append("translate_local")
+        if inpaint_background:
+            mode_parts.append("AOT inpaint")
+        mode_str = f" ({', '.join(mode_parts)})" if mode_parts else ""
         print(f"Sending {len(image_paths)} images to {endpoint}{mode_str}...")
         start = time.time()
         response = requests.post(url, files=files, data=data, timeout=300)
@@ -127,6 +132,12 @@ def print_stats(response: dict):
 
     print(f"\n  TIMINGS:")
     print(f"    Detection:     {stats.get('detect_ms', 'N/A')}ms")
+    if stats.get('label2_detected'):
+        print(f"    Label2 Regions:{stats.get('label2_detected', 0)}")
+    if stats.get('inpaint_l2_ms'):
+        print(f"    Inpaint L2:    {stats.get('inpaint_l2_ms', 'N/A')}ms (parallel with OCR)")
+    if stats.get('inpaint_l1_ms'):
+        print(f"    Inpaint L1:    {stats.get('inpaint_l1_ms', 'N/A')}ms (text areas)")
     print(f"    OCR:           {stats.get('ocr_ms', 'N/A')}ms")
     print(f"    Translation:   {stats.get('translation_ms', 'N/A')}ms")
     print(f"    Render:        {stats.get('render_ms', 'N/A')}ms")
@@ -188,6 +199,7 @@ def main():
     endpoint = "/translate/label1"
     ocr_translate = False
     translate_local = False
+    inpaint_background = True  # AOT inpainting enabled by default
 
     args = sys.argv[1:]
     for arg in args:
@@ -197,19 +209,23 @@ def main():
             ocr_translate = True
         elif arg in ['--translate-local', '--local', '-l']:
             translate_local = True
+        elif arg in ['--no-inpaint', '--no-aot', '-n']:
+            inpaint_background = False
         elif arg in ['--help', '-h']:
             print("Usage: python3.12 test_client.py [options]")
             print("")
             print("Options:")
-            print("  --label1           Text bubbles only (default)")
-            print("  --label2           With inpainting for text-free regions")
+            print("  --label1           Text bubbles only (default, with AOT inpainting)")
+            print("  --label2           Legacy mode with sequential inpainting")
+            print("  --no-inpaint       Disable AOT inpainting (white background only)")
             print("  --ocr-translate    Use VLM for combined OCR+translate (requires llama.cpp)")
             print("  --translate-local  Use local LLM for translation (HY-MT via llama.cpp)")
             print("")
             print("Modes:")
-            print("  Default:           VLM OCR -> Cerebras API translate")
-            print("  --ocr-translate:   VLM OCR+translate in one step")
-            print("  --translate-local: VLM OCR -> local LLM translate")
+            print("  Default:           VLM OCR -> Cerebras API translate + AOT inpaint (parallel)")
+            print("  --ocr-translate:   VLM OCR+translate in one step + AOT inpaint")
+            print("  --translate-local: VLM OCR -> local LLM translate + AOT inpaint")
+            print("  --no-inpaint:      Disable background inpainting (white out text only)")
             print("")
             print(f"Input:  {INPUT_DIR}/")
             print(f"Output: {OUTPUT_DIR}/")
@@ -247,10 +263,15 @@ def main():
         print(f"Using VLM OCR + Local LLM Translation")
     else:
         print(f"Using VLM OCR + Cerebras API Translation")
+    if inpaint_background:
+        print(f"AOT Inpainting: Enabled (parallel with OCR/translate)")
+    else:
+        print(f"AOT Inpainting: Disabled (white background only)")
     print()
 
     # Send request
-    response = send_request(endpoint, image_paths, ocr_translate=ocr_translate, translate_local=translate_local)
+    response = send_request(endpoint, image_paths, ocr_translate=ocr_translate,
+                           translate_local=translate_local, inpaint_background=inpaint_background)
 
     # Print stats
     if 'stats' in response:
@@ -264,6 +285,8 @@ def main():
             suffix = "_local"
         else:
             suffix = ""
+        if inpaint_background:
+            suffix += "_inpaint"
         output_subdir = OUTPUT_DIR + ("_label2" if "label2" in endpoint else "_label1") + suffix
         save_images(response, image_paths, output_subdir)
 

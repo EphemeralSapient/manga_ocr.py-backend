@@ -443,8 +443,43 @@ def inpaint_image(img_array: np.ndarray, bubbles: List[Dict], inpainter: Inpaint
     return img_array
 
 
+def inpaint_ocr_bboxes(img: Image.Image, bubbles: List[Dict], inpainter: Inpainter) -> Image.Image:
+    """Inpaint OCR text bboxes within bubbles (replaces white-out).
+
+    Args:
+        img: PIL Image to inpaint
+        bubbles: List of bubble dicts with 'texts' containing OCR bboxes
+        inpainter: Inpainter instance
+
+    Returns:
+        Inpainted PIL Image
+    """
+    img_array = np.array(img)
+
+    for bubble in bubbles:
+        texts = bubble.get('texts', [])
+        bubble_box = bubble.get('bubble_box', [0, 0, img.width, img.height])
+        bx1, by1, bx2, by2 = bubble_box
+        margin = 3
+        safe_bx1, safe_by1 = bx1 + margin, by1 + margin
+        safe_bx2, safe_by2 = bx2 - margin, by2 - margin
+
+        for text_item in texts:
+            tx1, ty1, tx2, ty2 = text_item['bbox']
+            # Clip to bubble bounds with margin
+            clipped = [max(tx1, safe_bx1), max(ty1, safe_by1),
+                      min(tx2, safe_bx2), min(ty2, safe_by2)]
+            if clipped[2] > clipped[0] and clipped[3] > clipped[1]:
+                # Inpaint this text bbox
+                coords, result = inpainter(img_array, clipped)
+                img_array[coords[0]:coords[1], coords[2]:coords[3]] = result
+
+    return Image.fromarray(img_array)
+
+
 def process_images_label1(images: List[Image.Image], api_key: str = None, output_type: str = "full_page",
-                          ocr_translate: bool = False, translate_local: bool = False) -> Tuple[List[Dict], Any, Dict]:
+                          ocr_translate: bool = False, translate_local: bool = False,
+                          inpaint_background: bool = True) -> Tuple[List[Dict], Any, Dict]:
     """Process images for label 1 (text bubbles): detect -> OCR -> translate -> render
 
     Args:
@@ -453,19 +488,62 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
         output_type: One of "full_page", "speech_image_only", "text_only"
         ocr_translate: If True, use VLM to OCR and translate in one step
         translate_local: If True, use local LLM (HY-MT) for translation instead of Cerebras API
+        inpaint_background: If True, detect label2 regions and inpaint them in parallel (AOT inpainting)
 
     Returns:
         Tuple of (ocr_data, output, stats) where output varies by output_type
     """
-    stats = {"pages": len(images), "output_type": output_type, "ocr_translate": ocr_translate, "translate_local": translate_local}
+    stats = {"pages": len(images), "output_type": output_type, "ocr_translate": ocr_translate, "translate_local": translate_local, "inpaint_background": inpaint_background}
     session, mode = get_detector()
 
-    # Detect bubbles
+    # Detect bubbles (label1) and text-free regions (label2) if inpainting enabled
     t0 = time.time()
     bubbles, detect_time = detect_all(session, images, mode, target_label=1)
+
+    bubbles_l2 = []
+    inpaint_future = None
+    inpainted_images = None
+
+    if inpaint_background and output_type != "text_only":
+        # Detect label2 regions for inpainting
+        bubbles_l2, detect_time_l2 = detect_all(session, images, mode, target_label=2)
+        stats["label2_detected"] = len(bubbles_l2)
+        detect_time += detect_time_l2
+        print(f"  [Detect] {len(bubbles)} bubbles (L1) + {len(bubbles_l2)} text-free regions (L2) in {detect_time:.0f}ms")
+
+        # Start inpainting in background (runs in parallel with OCR/translate)
+        if bubbles_l2:
+            inpainter = get_inpainter()
+
+            # Build l2_data by page
+            l2_data = {}
+            for b in bubbles_l2:
+                page_idx = b['page_idx']
+                if page_idx not in l2_data:
+                    l2_data[page_idx] = []
+                l2_data[page_idx].append({
+                    'bubble_box': list(b['box'])
+                })
+
+            def do_inpainting():
+                t_start = time.time()
+                inpainted = []
+                for page_idx, img in enumerate(images):
+                    img_array = np.array(img)
+                    page_l2 = l2_data.get(page_idx, [])
+                    if page_l2:
+                        img_array = inpaint_image(img_array, page_l2, inpainter)
+                    inpainted.append(Image.fromarray(img_array))
+                return inpainted, int((time.time() - t_start) * 1000)
+
+            # Start inpainting in background thread (non-blocking)
+            _inpaint_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            inpaint_future = _inpaint_executor.submit(do_inpainting)
+    else:
+        print(f"  [Detect] {len(bubbles)} bubbles in {detect_time:.0f}ms")
+
     stats["detect_ms"] = int(detect_time)
     stats["bubbles_detected"] = len(bubbles)
-    print(f"  [Detect] {len(bubbles)} bubbles in {detect_time:.0f}ms")
 
     # Sequential model loading: start OCR server on demand
     uses_vlm_ocr = OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8")
@@ -628,13 +706,42 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
         return ocr_data, text_output, stats
 
     elif output_type == "speech_image_only":
+        # Wait for label2 inpainting to complete if running
+        use_inpaint = False
+        if inpaint_future is not None:
+            try:
+                inpainted_images, inpaint_ms = inpaint_future.result(timeout=120)
+                stats["inpaint_l2_ms"] = inpaint_ms
+                use_inpaint = True
+                print(f"  [Inpaint L2] Completed {len(bubbles_l2)} regions in {inpaint_ms}ms")
+            except Exception as e:
+                print(f"  [Inpaint L2] Failed: {e}")
+                inpainted_images = None
+
+        # Also inpaint OCR text bboxes (label1 text areas)
+        if use_inpaint and inpainted_images:
+            t_l1 = time.time()
+            inpainter = get_inpainter()
+            final_images = []
+            for page_idx, img in enumerate(inpainted_images):
+                page_bubbles = ocr_data.get(page_idx, [])
+                if page_bubbles:
+                    img = inpaint_ocr_bboxes(img, page_bubbles, inpainter)
+                final_images.append(img)
+            inpaint_l1_ms = int((time.time() - t_l1) * 1000)
+            stats["inpaint_l1_ms"] = inpaint_l1_ms
+            print(f"  [Inpaint L1] Completed OCR text areas in {inpaint_l1_ms}ms")
+            source_images = final_images
+        else:
+            source_images = inpainted_images if use_inpaint else images
+
         # Extract and return cropped bubble images with positions
         t0 = time.time()
         bubble_images_output = {}
         for page_idx, page_bubbles in sorted(ocr_data.items()):
             bubble_images_output[page_idx] = []
             page_translations = translation_data.get(page_idx, {})
-            img = images[page_idx]
+            img = source_images[page_idx]
 
             for bubble in page_bubbles:
                 # Create a copy of just the bubble area
@@ -651,7 +758,7 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
                     'texts': bubble['texts']
                 }
                 temp_translations = {bubble['idx']: page_translations.get(bubble['idx'], "[MISSING]")}
-                rendered_bubble = render_text_on_image(bubble_copy, [temp_bubble], temp_translations)
+                rendered_bubble = render_text_on_image(bubble_copy, [temp_bubble], temp_translations, use_inpaint=use_inpaint)
 
                 # Convert to base64
                 buf = io.BytesIO()
@@ -663,30 +770,60 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
                     'bubble_box': bbox,  # Position on original page
                     'image_base64': b64,
                     'original_text': "".join([t['text'] for t in bubble['texts']]),
-                    'translated_text': page_translations.get(bubble['idx'], "[MISSING]")
+                    'translated_text': page_translations.get(bubble['idx'], "[MISSING]"),
+                    'inpainted_background': use_inpaint
                 }
                 bubble_images_output[page_idx].append(bubble_data)
 
         render_time = int((time.time() - t0) * 1000)
         stats["render_ms"] = render_time
         stats["bubble_count"] = sum(len(bubbles) for bubbles in bubble_images_output.values())
-        print(f"  [Speech Image Only] Extracted {stats['bubble_count']} bubble images in {render_time}ms")
+        print(f"  [Speech Image Only] Extracted {stats['bubble_count']} bubble images in {render_time}ms" + (" (inpainted)" if use_inpaint else ""))
         return ocr_data, bubble_images_output, stats
 
     else:  # full_page (default)
+        # Wait for label2 inpainting to complete if running
+        use_inpaint = False
+        if inpaint_future is not None:
+            try:
+                inpainted_images, inpaint_ms = inpaint_future.result(timeout=120)
+                stats["inpaint_l2_ms"] = inpaint_ms
+                use_inpaint = True
+                print(f"  [Inpaint L2] Completed {len(bubbles_l2)} regions in {inpaint_ms}ms")
+            except Exception as e:
+                print(f"  [Inpaint L2] Failed: {e}")
+                inpainted_images = None
+
+        # Also inpaint OCR text bboxes (label1 text areas)
+        if use_inpaint and inpainted_images:
+            t_l1 = time.time()
+            inpainter = get_inpainter()
+            final_images = []
+            for page_idx, img in enumerate(inpainted_images):
+                page_bubbles = ocr_data.get(page_idx, [])
+                if page_bubbles:
+                    img = inpaint_ocr_bboxes(img, page_bubbles, inpainter)
+                final_images.append(img)
+            inpaint_l1_ms = int((time.time() - t_l1) * 1000)
+            stats["inpaint_l1_ms"] = inpaint_l1_ms
+            print(f"  [Inpaint L1] Completed OCR text areas in {inpaint_l1_ms}ms")
+            source_images = final_images
+        else:
+            source_images = inpainted_images if use_inpaint else images
+
         # Render full pages
         t0 = time.time()
         output_images = []
-        for page_idx, img in enumerate(images):
+        for page_idx, img in enumerate(source_images):
             img_copy = img.copy()
             page_bubbles = ocr_data.get(page_idx, [])
             page_translations = translation_data.get(page_idx, {})
-            rendered = render_text_on_image(img_copy, page_bubbles, page_translations)
+            rendered = render_text_on_image(img_copy, page_bubbles, page_translations, use_inpaint=use_inpaint)
             output_images.append(rendered)
 
         render_time = int((time.time() - t0) * 1000)
         stats["render_ms"] = render_time
-        print(f"  [Full Page] Rendered {len(output_images)} pages in {render_time}ms")
+        print(f"  [Full Page] Rendered {len(output_images)} pages in {render_time}ms" + (" (inpainted)" if use_inpaint else ""))
         return ocr_data, output_images, stats
 
 
@@ -873,7 +1010,7 @@ def process_images_label2(images: List[Image.Image], api_key: str = None, output
                     'texts': bubble['texts']
                 }
                 temp_translations = {bubble['idx']: page_translations.get(bubble['idx'], "[MISSING]")}
-                rendered_bubble = render_text_on_image(bubble_copy, [temp_bubble], temp_translations)
+                rendered_bubble = render_text_on_image(bubble_copy, [temp_bubble], temp_translations, use_inpaint=True)
 
                 # Convert to base64
                 buf = io.BytesIO()
@@ -893,7 +1030,7 @@ def process_images_label2(images: List[Image.Image], api_key: str = None, output
         render_time = int((time.time() - t0) * 1000)
         stats["render_ms"] = render_time
         stats["bubble_count"] = sum(len(bubbles) for bubbles in bubble_images_output.values())
-        print(f"  [Speech Image Only] Extracted {stats['bubble_count']} bubble images in {render_time}ms")
+        print(f"  [Speech Image Only] Extracted {stats['bubble_count']} bubble images in {render_time}ms (inpainted)")
         return ocr_data, bubble_images_output, stats
 
     else:  # full_page (default)
@@ -903,7 +1040,7 @@ def process_images_label2(images: List[Image.Image], api_key: str = None, output
         for page_idx, img in enumerate(inpainted_images):
             page_bubbles = ocr_data.get(page_idx, [])
             page_translations = translation_data.get(page_idx, {})
-            rendered = render_text_on_image(img, page_bubbles, page_translations)
+            rendered = render_text_on_image(img, page_bubbles, page_translations, use_inpaint=True)
             output_images.append(rendered)
 
         render_time = int((time.time() - t0) * 1000)
@@ -942,6 +1079,7 @@ def translate_label1():
     # Parse translation mode flags - apply defaults from config if not explicitly set
     ocr_translate_param = request.form.get('ocr_translate', None)
     translate_local_param = request.form.get('translate_local', None)
+    inpaint_background_param = request.form.get('inpaint_background', None)
 
     # If neither flag is explicitly set, use default from config
     if ocr_translate_param is None and translate_local_param is None:
@@ -950,6 +1088,12 @@ def translate_label1():
     else:
         ocr_translate = (ocr_translate_param or '').lower() in ('true', '1', 'yes')
         translate_local = (translate_local_param or '').lower() in ('true', '1', 'yes')
+
+    # AOT inpainting: default True (inpaint label2 regions in parallel with OCR/translate)
+    if inpaint_background_param is None:
+        inpaint_background = True
+    else:
+        inpaint_background = (inpaint_background_param or '').lower() in ('true', '1', 'yes')
 
     # Validate output_type
     if output_type not in ['full_page', 'speech_image_only', 'text_only']:
@@ -976,16 +1120,19 @@ def translate_label1():
             mode_str = "ocr_vlm + translate_local (LLM)"
         else:
             mode_str = "ocr_vlm + translate_api (Cerebras)"
-        print(f"Processing {len(images)} images ({mode_str}, output_type={output_type})...")
+        inpaint_str = " + AOT inpaint" if inpaint_background else ""
+        print(f"Processing {len(images)} images ({mode_str}{inpaint_str}, output_type={output_type})...")
         if api_key:
             print(f"  Using custom API key: {api_key[:10]}...")
         if ocr_translate:
             print(f"  OCR+Translate mode: {'VLM available' if HAS_VLM_OCR else 'VLM not available (will use standard flow)'}")
         if translate_local and not ocr_translate:
             print(f"  Local translate: {'Available' if HAS_LOCAL_TRANSLATE else 'Not available'}")
+        if inpaint_background:
+            print(f"  AOT Inpainting: Enabled (label2 regions inpainted in parallel)")
 
         # Process
-        ocr_data, output, stats = process_images_label1(images, api_key, output_type, ocr_translate, translate_local)
+        ocr_data, output, stats = process_images_label1(images, api_key, output_type, ocr_translate, translate_local, inpaint_background)
 
         # Format response based on output_type
         elapsed = time.time() - start_time
@@ -1603,11 +1750,16 @@ if __name__ == '__main__':
     print("")
 
     print("Endpoints:")
-    print("  POST /translate/label1  - Text bubbles (no inpainting)")
-    print("  POST /translate/label2  - With inpainting")
+    print("  POST /translate/label1  - Text bubbles + AOT inpainting (default)")
+    print("  POST /translate/label2  - Legacy mode (sequential inpainting)")
     if STREAMING_ENABLED:
         print("  POST /translate/label1/stream - SSE streaming (parallel OCR→translate)")
     print("  GET  /health           - Health check")
+    print("")
+    print("AOT Inpainting (default enabled):")
+    print("  Label1 now detects both label1 (text) and label2 (text-free) regions")
+    print("  Inpainting runs in PARALLEL with OCR/translate for faster processing")
+    print("  Use inpaint_background=false to disable (white background only)")
     print("")
     print("Translation modes:")
     print(f"  {'*' if DEFAULT_TRANSLATE_MODE == 'vlm' else ' '} ocr_translate=true   - VLM does OCR+translate")

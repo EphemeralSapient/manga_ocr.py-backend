@@ -120,6 +120,20 @@ DEFAULT_CONFIG = {
     "detection_padding": 5,
 
     # ══════════════════════════════════════════════════════════════════════════
+    # Text Segmentation Settings (config.json only)
+    # Uses comic-text-detector for pixel-level text masks (better inpainting)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # Enable text segmentation masks for inpainting (instead of bbox-only)
+    "text_seg_enabled": True,
+
+    # Text segmentation model path (relative to project root)
+    "text_seg_model": "text_seg/comic-text-detector/data/comictextdetector.pt.onnx",
+
+    # Text segmentation input size (1024 recommended)
+    "text_seg_input_size": 1024,
+
+    # ══════════════════════════════════════════════════════════════════════════
     # Translation API Settings (config.json only)
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -303,6 +317,16 @@ def get_detection_threshold() -> float:
 
 def get_detection_padding() -> int:
     return get("detection_padding", 5)
+
+# Text segmentation settings
+def get_text_seg_enabled() -> bool:
+    return get("text_seg_enabled", True)
+
+def get_text_seg_model() -> str:
+    return get("text_seg_model", "text_seg/comic-text-detector/data/comictextdetector.pt.onnx")
+
+def get_text_seg_input_size() -> int:
+    return get("text_seg_input_size", 1024)
 
 # Translation settings
 def get_translation_temperature() -> float:

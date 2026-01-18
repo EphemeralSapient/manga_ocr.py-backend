@@ -20,6 +20,11 @@ MODELS = {
 AOT_PT_URL = "https://huggingface.co/ogkalu/aot-inpainting/resolve/main/aot_traced.pt"
 AOT_ONNX_URL = "https://huggingface.co/ogkalu/aot-inpainting/resolve/main/aot.onnx"
 
+# Comic text detector for text segmentation masks
+# From: https://github.com/dmMaze/comic-text-detector
+TEXT_SEG_MODEL_URL = "https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.2.1/comictextdetector.pt.onnx"
+TEXT_SEG_MODEL_PATH = "text_seg/comic-text-detector/data/comictextdetector.pt.onnx"
+
 
 def download_file(url, output):
     """Download a file with progress bar"""
@@ -69,6 +74,11 @@ def download():
     else:
         print(f"\nUsing PyTorch inpainting (MPS/CPU)")
         download_file(AOT_PT_URL, "aot_traced.pt")
+
+    # Download text segmentation model (comic-text-detector)
+    print(f"\nDownloading text segmentation model...")
+    os.makedirs(os.path.dirname(TEXT_SEG_MODEL_PATH), exist_ok=True)
+    download_file(TEXT_SEG_MODEL_URL, TEXT_SEG_MODEL_PATH)
 
 
 if __name__ == "__main__":

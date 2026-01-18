@@ -104,7 +104,8 @@ def fit_text(text: str, box: List[int]) -> Tuple[List[str], ImageFont.FreeTypeFo
 def render_text_on_image(
     img: Image.Image,
     bubbles: List[Dict],
-    translations: Dict[int, str]
+    translations: Dict[int, str],
+    use_inpaint: bool = False
 ) -> Image.Image:
     """
     Render translated text onto image.
@@ -113,6 +114,7 @@ def render_text_on_image(
         img: PIL Image to render on
         bubbles: List of bubble dicts with 'idx', 'bubble_box', 'texts'
         translations: Dict mapping bubble idx to translated text
+        use_inpaint: If True, skip white-out (background already inpainted)
 
     Returns:
         Modified PIL Image
@@ -129,18 +131,19 @@ def render_text_on_image(
         if translated == "[NO TEXT]":
             continue
 
-        # White out OCR text bboxes (clipped to bubble bounds)
-        bx1, by1, bx2, by2 = bubble_box
-        margin = 3
-        safe_bx1, safe_by1 = bx1 + margin, by1 + margin
-        safe_bx2, safe_by2 = bx2 - margin, by2 - margin
+        # White out OCR text bboxes (clipped to bubble bounds) - skip if inpainted
+        if not use_inpaint:
+            bx1, by1, bx2, by2 = bubble_box
+            margin = 3
+            safe_bx1, safe_by1 = bx1 + margin, by1 + margin
+            safe_bx2, safe_by2 = bx2 - margin, by2 - margin
 
-        for text_item in texts:
-            tx1, ty1, tx2, ty2 = text_item["bbox"]
-            clipped = [max(tx1, safe_bx1), max(ty1, safe_by1),
-                       min(tx2, safe_bx2), min(ty2, safe_by2)]
-            if clipped[2] > clipped[0] and clipped[3] > clipped[1]:
-                draw.rectangle(clipped, fill="white")
+            for text_item in texts:
+                tx1, ty1, tx2, ty2 = text_item["bbox"]
+                clipped = [max(tx1, safe_bx1), max(ty1, safe_by1),
+                           min(tx2, safe_bx2), min(ty2, safe_by2)]
+                if clipped[2] > clipped[0] and clipped[3] > clipped[1]:
+                    draw.rectangle(clipped, fill="white")
 
         # Render translated text
         if translated:

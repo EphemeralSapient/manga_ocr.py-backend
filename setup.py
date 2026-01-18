@@ -634,19 +634,20 @@ import os
 os.environ.setdefault('ORT_TENSORRT_ENGINE_CACHE_ENABLE', '1')
 os.environ.setdefault('ORT_TENSORRT_FP16_ENABLE', '1')
 
-import numpy as np
 from PIL import Image
 
 # Create demo image (640x640 manga-like)
 demo = Image.new('RGB', (640, 640), (255, 255, 255))
 
-# Import and run detector
+# Import and run detector with TensorRT (static model preferred for GPU)
 try:
-    from workflow import create_session, detect_all
-    session = create_session()
+    from workflow import detect_mode, create_session, detect_all
+    mode = detect_mode()
+    print(f"WARMUP:mode:{mode}")
+    session, _ = create_session(mode)
     print("WARMUP:detector_loaded")
 
-    # Run detection on demo image
+    # Run detection on demo image to build TensorRT engine
     results = detect_all([demo], session)
     print("WARMUP:detector_done")
 except Exception as e:
@@ -674,6 +675,11 @@ print("WARMUP:complete")
 
     if result.returncode == 0:
         output = result.stdout
+        # Extract and show mode
+        for line in output.splitlines():
+            if line.startswith('WARMUP:mode:'):
+                mode = line.split(':')[-1]
+                info(f"Detector mode: {mode}")
         if 'WARMUP:detector_done' in output:
             ok("Detector engine cached")
         if 'WARMUP:inpainter_done' in output:
