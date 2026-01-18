@@ -492,7 +492,8 @@ class VlmOCR:
                         continue
 
                 if output:
-                    print(f"[VLM OCR] Output ({len(output)} chars): {output[:500]}{'...' if len(output) > 500 else ''}")
+                    attempt_str = f" (attempt {attempt + 1}/{max_retries + 1})" if attempt > 0 else ""
+                    print(f"[VLM OCR] Output ({len(output)} chars){attempt_str}: {output[:500]}{'...' if len(output) > 500 else ''}")
 
                 lines = parse_ocr_output(output, positions, grid_info, is_translated=translate) if positions and grid_info else []
 
@@ -504,8 +505,10 @@ class VlmOCR:
 
             except requests.exceptions.Timeout:
                 last_error = 'Request timed out'
+                print(f"[VLM OCR] Timeout, attempt {attempt + 1}/{max_retries + 1}")
             except Exception as e:
                 last_error = str(e)
+                print(f"[VLM OCR] Error: {str(e)[:100]}, attempt {attempt + 1}/{max_retries + 1}")
 
         return {'lines': [], 'line_count': 0, 'processing_time_ms': (time.time() - t0) * 1000,
                 'translated': translate, 'error': last_error}
