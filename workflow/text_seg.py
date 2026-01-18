@@ -50,38 +50,66 @@ def letterbox(img: np.ndarray, new_shape=(640, 640), auto=False, stride=32):
     left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
     img = np.pad(img, ((top, bottom), (left, right), (0, 0)), mode='constant', constant_values=114)
 
-    return img, r, (int(dw * 2), int(dh * 2))
+    # Return individual padding values for correct removal later
+    return img, r, (left, right, top, bottom)
 
 
-def preprocess(img: np.ndarray, input_size: int = 1024) -> Tuple[np.ndarray, float, int, int]:
-    """Preprocess image for text segmentation model."""
+def preprocess(img: np.ndarray, input_size: int = 1024) -> Tuple[np.ndarray, float, Tuple[int, int, int, int]]:
+    """Preprocess image for text segmentation model.
+
+    Returns:
+        img_in: Preprocessed image tensor
+        ratio: Scale ratio
+        padding: (left, right, top, bottom) padding values
+    """
     # Input is RGB numpy array (from PIL or server)
     img_rgb = img
 
     # Letterbox resize
-    img_in, ratio, (dw, dh) = letterbox(img_rgb, new_shape=(input_size, input_size), auto=False, stride=64)
+    img_in, ratio, padding = letterbox(img_rgb, new_shape=(input_size, input_size), auto=False, stride=64)
 
     # HWC to CHW, normalize
     img_in = img_in.transpose((2, 0, 1))  # HWC to CHW
     img_in = np.ascontiguousarray(img_in).astype(np.float32) / 255.0
     img_in = img_in[np.newaxis, ...]  # Add batch dimension
 
-    return img_in, ratio, dw, dh
+    return img_in, ratio, padding
 
 
-def postprocess_mask(mask: np.ndarray, dw: int, dh: int, orig_size: Tuple[int, int]) -> np.ndarray:
-    """Postprocess mask output to original image size."""
+def postprocess_mask(mask: np.ndarray, padding: Tuple[int, int, int, int], orig_size: Tuple[int, int]) -> np.ndarray:
+    """Postprocess mask output to original image size.
+
+    Args:
+        mask: Raw mask from model
+        padding: (left, right, top, bottom) padding that was added
+        orig_size: (height, width) of original image
+    """
     mask = mask.squeeze()
+    left, right, top, bottom = padding
 
-    # Remove padding
-    if dh > 0:
-        mask = mask[:-dh, :]
-    if dw > 0:
-        mask = mask[:, :-dw]
+    # Remove padding from all sides
+    h, w = mask.shape[:2]
+    y1 = top
+    y2 = h - bottom if bottom > 0 else h
+    x1 = left
+    x2 = w - right if right > 0 else w
+    mask = mask[y1:y2, x1:x2]
+
+    # Convert to uint8 [0, 255] range
+    # Model may output [0,1] float, [0,255] float, or already uint8
+    if mask.dtype == np.uint8:
+        # Already uint8, use as-is
+        pass
+    elif mask.max() <= 1.0:
+        # Assume [0, 1] range, scale to [0, 255]
+        mask = (mask * 255).astype(np.uint8)
+    else:
+        # Assume [0, 255] range already, just convert type
+        mask = np.clip(mask, 0, 255).astype(np.uint8)
 
     # Resize to original using PIL
     im_h, im_w = orig_size
-    mask_pil = Image.fromarray((mask * 255).astype(np.uint8))
+    mask_pil = Image.fromarray(mask)
     mask_pil = mask_pil.resize((im_w, im_h), Image.BILINEAR)
     mask = np.array(mask_pil)
 
@@ -133,7 +161,7 @@ class TextSegmenter:
         im_h, im_w = img.shape[:2]
 
         # Preprocess
-        img_in, ratio, dw, dh = preprocess(img, self.input_size)
+        img_in, ratio, padding = preprocess(img, self.input_size)
 
         # Run inference
         outputs = self.sess.run(self.output_names, {'images': img_in})
@@ -147,7 +175,7 @@ class TextSegmenter:
             mask = outputs[2]  # swap with lines_map
 
         # Postprocess
-        result = postprocess_mask(mask, dw, dh, (im_h, im_w))
+        result = postprocess_mask(mask, padding, (im_h, im_w))
 
         # Stats
         elapsed = time.time() - t0

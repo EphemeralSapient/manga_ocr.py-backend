@@ -18,3 +18,4 @@ output/*
 data/
 .llama_logs/
 llama.cpp
+*.tar

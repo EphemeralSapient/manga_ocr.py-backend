@@ -124,7 +124,13 @@ def render_text_on_image(
         Modified PIL Image
     """
     draw = ImageDraw.Draw(img)
-    img_array = None  # Lazy load for text_seg
+    img_array = np.array(img)
+    full_page_mask = None
+
+    # Run text segmentation on FULL PAGE once (much better than per-bubble)
+    # The model needs full page context to detect text accurately
+    if text_segmenter is not None and bubbles:
+        full_page_mask = text_segmenter(img_array, verbose=False)
 
     for bubble in bubbles:
         idx = bubble["idx"]
@@ -140,24 +146,14 @@ def render_text_on_image(
         # L1 bubbles always need text removed - use text_seg for pixel-level or bbox fallback
         bx1, by1, bx2, by2 = bubble_box
 
-        if text_segmenter is not None:
-            # Pixel-level text cleaning using text segmentation
-            if img_array is None:
-                img_array = np.array(img)
+        if full_page_mask is not None:
+            # Extract mask region for this bubble from full-page mask
+            mask_region = full_page_mask[by1:by2, bx1:bx2]
 
-            # Extract bubble region
-            region = img_array[by1:by2, bx1:bx2]
-            if region.size > 0:
-                # Get text mask for this region
-                text_mask = text_segmenter(region, verbose=False)
-
-                # Fill text pixels with white
-                if np.any(text_mask > 127):
-                    # Apply white fill where text is detected
-                    region[text_mask > 127] = 255
-
-                    # Update image array
-                    img_array[by1:by2, bx1:bx2] = region
+            # Fill text pixels with white using the pre-computed mask
+            # Use low threshold (30) to catch full characters including anti-aliased edges
+            if np.any(mask_region > 30):
+                img_array[by1:by2, bx1:bx2][mask_region > 30] = 255
 
         else:
             # Fallback: bbox-based white fill
@@ -172,10 +168,9 @@ def render_text_on_image(
                 if clipped[2] > clipped[0] and clipped[3] > clipped[1]:
                     draw.rectangle(clipped, fill="white")
 
-    # Convert back from array if text_seg was used
-    if img_array is not None:
-        img = Image.fromarray(img_array)
-        draw = ImageDraw.Draw(img)
+    # Convert back from array
+    img = Image.fromarray(img_array)
+    draw = ImageDraw.Draw(img)
 
     # Render translated text
     for bubble in bubbles:
