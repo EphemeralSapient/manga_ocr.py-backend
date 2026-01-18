@@ -569,6 +569,10 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
     stats = {"pages": len(images), "output_type": output_type, "ocr_translate": ocr_translate, "translate_local": translate_local, "inpaint_background": inpaint_background}
     session, mode = get_detector()
 
+    # Get text segmenter for L1 text cleaning (pixel-level white fill)
+    # This is separate from L2 inpainting - L1 uses text_seg to fill with white, not AOT
+    text_seg_l1 = get_text_segmenter_instance() if (TEXT_SEG_ENABLED and output_type != "text_only") else None
+
     # Detect bubbles (label1) and text-free regions (label2) if inpainting enabled
     t0 = time.time()
     bubbles, detect_time = detect_all(session, images, mode, target_label=1)
@@ -824,7 +828,8 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
                     'texts': bubble['texts']
                 }
                 temp_translations = {bubble['idx']: page_translations.get(bubble['idx'], "[MISSING]")}
-                rendered_bubble = render_text_on_image(bubble_copy, [temp_bubble], temp_translations, use_inpaint=use_inpaint)
+                # Use text_seg_l1 for pixel-level text cleaning (fills with white)
+                rendered_bubble = render_text_on_image(bubble_copy, [temp_bubble], temp_translations, use_inpaint=use_inpaint, text_segmenter=text_seg_l1)
 
                 # Convert to base64
                 buf = io.BytesIO()
@@ -871,7 +876,8 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
             img_copy = img.copy()
             page_bubbles = ocr_data.get(page_idx, [])
             page_translations = translation_data.get(page_idx, {})
-            rendered = render_text_on_image(img_copy, page_bubbles, page_translations, use_inpaint=use_inpaint)
+            # Use text_seg_l1 for pixel-level text cleaning (fills with white)
+            rendered = render_text_on_image(img_copy, page_bubbles, page_translations, use_inpaint=use_inpaint, text_segmenter=text_seg_l1)
             output_images.append(rendered)
 
         render_time = int((time.time() - t0) * 1000)
@@ -1070,7 +1076,8 @@ def process_images_label2(images: List[Image.Image], api_key: str = None, output
                     'texts': bubble['texts']
                 }
                 temp_translations = {bubble['idx']: page_translations.get(bubble['idx'], "[MISSING]")}
-                rendered_bubble = render_text_on_image(bubble_copy, [temp_bubble], temp_translations, use_inpaint=True)
+                # Use text_seg for pixel-level text cleaning (L1 text bubbles inside L2 inpainted image)
+                rendered_bubble = render_text_on_image(bubble_copy, [temp_bubble], temp_translations, use_inpaint=True, text_segmenter=text_seg)
 
                 # Convert to base64
                 buf = io.BytesIO()
@@ -1100,7 +1107,8 @@ def process_images_label2(images: List[Image.Image], api_key: str = None, output
         for page_idx, img in enumerate(inpainted_images):
             page_bubbles = ocr_data.get(page_idx, [])
             page_translations = translation_data.get(page_idx, {})
-            rendered = render_text_on_image(img, page_bubbles, page_translations, use_inpaint=True)
+            # Use text_seg for pixel-level text cleaning (L1 text bubbles inside L2 inpainted image)
+            rendered = render_text_on_image(img, page_bubbles, page_translations, use_inpaint=True, text_segmenter=text_seg)
             output_images.append(rendered)
 
         render_time = int((time.time() - t0) * 1000)

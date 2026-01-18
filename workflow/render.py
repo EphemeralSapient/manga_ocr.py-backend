@@ -7,10 +7,12 @@ Features:
 - Binary search for optimal font fit
 - Automatic text wrapping
 - Skip [NO TEXT] markers (sound effects, etc.)
+- Text segmentation for pixel-level text cleaning (L1 bubbles)
 """
 
 import os
-from typing import List, Dict, Tuple, Any
+import numpy as np
+from typing import List, Dict, Tuple, Any, Optional
 from PIL import Image, ImageDraw, ImageFont
 
 # Font search paths
@@ -105,7 +107,8 @@ def render_text_on_image(
     img: Image.Image,
     bubbles: List[Dict],
     translations: Dict[int, str],
-    use_inpaint: bool = False
+    use_inpaint: bool = False,
+    text_segmenter = None
 ) -> Image.Image:
     """
     Render translated text onto image.
@@ -114,12 +117,14 @@ def render_text_on_image(
         img: PIL Image to render on
         bubbles: List of bubble dicts with 'idx', 'bubble_box', 'texts'
         translations: Dict mapping bubble idx to translated text
-        use_inpaint: If True, skip white-out (background already inpainted)
+        use_inpaint: If True, L2 background was inpainted (informational only)
+        text_segmenter: Optional TextSegmenter for pixel-level text cleaning (L1 bubbles)
 
     Returns:
         Modified PIL Image
     """
     draw = ImageDraw.Draw(img)
+    img_array = None  # Lazy load for text_seg
 
     for bubble in bubbles:
         idx = bubble["idx"]
@@ -131,9 +136,31 @@ def render_text_on_image(
         if translated == "[NO TEXT]":
             continue
 
-        # White out OCR text bboxes (clipped to bubble bounds) - skip if inpainted
-        if not use_inpaint:
-            bx1, by1, bx2, by2 = bubble_box
+        # Always clean text in L1 bubbles (don't skip even if L2 was inpainted)
+        # L1 bubbles always need text removed - use text_seg for pixel-level or bbox fallback
+        bx1, by1, bx2, by2 = bubble_box
+
+        if text_segmenter is not None:
+            # Pixel-level text cleaning using text segmentation
+            if img_array is None:
+                img_array = np.array(img)
+
+            # Extract bubble region
+            region = img_array[by1:by2, bx1:bx2]
+            if region.size > 0:
+                # Get text mask for this region
+                text_mask = text_segmenter(region, verbose=False)
+
+                # Fill text pixels with white
+                if np.any(text_mask > 127):
+                    # Apply white fill where text is detected
+                    region[text_mask > 127] = 255
+
+                    # Update image array
+                    img_array[by1:by2, bx1:bx2] = region
+
+        else:
+            # Fallback: bbox-based white fill
             margin = 3
             safe_bx1, safe_by1 = bx1 + margin, by1 + margin
             safe_bx2, safe_by2 = bx2 - margin, by2 - margin
@@ -145,18 +172,30 @@ def render_text_on_image(
                 if clipped[2] > clipped[0] and clipped[3] > clipped[1]:
                     draw.rectangle(clipped, fill="white")
 
-        # Render translated text
-        if translated:
-            lines, font, start_x, start_y = fit_text(translated, bubble_box)
-            line_height = font.size + 4 if hasattr(font, 'size') else 12
+    # Convert back from array if text_seg was used
+    if img_array is not None:
+        img = Image.fromarray(img_array)
+        draw = ImageDraw.Draw(img)
 
-            box_width = bubble_box[2] - bubble_box[0]
-            for i, line in enumerate(lines):
-                bbox = font.getbbox(line)
-                text_width = bbox[2] - bbox[0]
-                text_x = bubble_box[0] + (box_width - text_width) // 2
-                text_y = start_y + i * line_height
-                draw.text((text_x, text_y), line, fill="black", font=font)
+    # Render translated text
+    for bubble in bubbles:
+        idx = bubble["idx"]
+        bubble_box = bubble["bubble_box"]
+
+        translated = translations.get(idx, "")
+        if translated == "[NO TEXT]" or not translated:
+            continue
+
+        lines, font, start_x, start_y = fit_text(translated, bubble_box)
+        line_height = font.size + 4 if hasattr(font, 'size') else 12
+
+        box_width = bubble_box[2] - bubble_box[0]
+        for i, line in enumerate(lines):
+            bbox = font.getbbox(line)
+            text_width = bbox[2] - bbox[0]
+            text_x = bubble_box[0] + (box_width - text_width) // 2
+            text_y = start_y + i * line_height
+            draw.text((text_x, text_y), line, fill="black", font=font)
 
     return img
 
