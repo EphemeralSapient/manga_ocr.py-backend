@@ -180,18 +180,59 @@ def _start_llama_servers():
                     env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
                 )
 
-    # Wait for servers to be ready (up to 60 seconds for model download)
+    # Wait for servers to be ready (up to 300 seconds for model download)
     if needs_llama():
         import time
-        print("  Waiting for servers to start (may download models)...")
-        for i in range(60):
-            ocr_ok = check_vlm_server() if OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8") else True
-            trans_ok = check_translate_server() if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt") and not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm") else True
+        import requests
+
+        def _check_server_health(url):
+            """Strict health check - only returns True if server responds OK."""
+            try:
+                r = requests.get(f"{url}/health", timeout=2)
+                return r.status_code == 200
+            except:
+                return False
+
+        timeout_seconds = 300  # 5 minutes for model downloads
+        print(f"  Waiting for servers to start (up to {timeout_seconds}s, may download models)...")
+
+        check_ocr = OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8")
+        check_trans = TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt") and not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm")
+
+        ocr_url = get_ocr_server_url()
+        trans_url = get_translate_server_url()
+
+        ocr_ok = not check_ocr  # True if not checking
+        trans_ok = not check_trans  # True if not checking
+
+        for i in range(timeout_seconds):
+            if check_ocr and not ocr_ok:
+                ocr_ok = _check_server_health(ocr_url)
+                if ocr_ok:
+                    print(f"    OCR server ready ({i}s)")
+
+            if check_trans and not trans_ok:
+                trans_ok = _check_server_health(trans_url)
+                if trans_ok:
+                    print(f"    Translation server ready ({i}s)")
+
             if ocr_ok and trans_ok:
+                print(f"  All servers ready in {i}s")
                 break
+
             time.sleep(1)
-            if i > 0 and i % 10 == 0:
-                print(f"    Still waiting... ({i}s)")
+            if i > 0 and i % 15 == 0:
+                status = []
+                if check_ocr:
+                    status.append(f"OCR={'ready' if ocr_ok else 'loading'}")
+                if check_trans:
+                    status.append(f"Translate={'ready' if trans_ok else 'loading'}")
+                print(f"    Still waiting... ({i}s) [{', '.join(status)}]")
+
+        # Final status check after timeout
+        if not (ocr_ok and trans_ok):
+            print(f"  Warning: Timeout after {timeout_seconds}s, but servers may still be starting...")
+            print(f"    Check logs in .llama_logs/ for details")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1787,13 +1828,9 @@ if __name__ == '__main__':
     # Auto-start llama servers if configured and needed
     if needs_llama() and AUTO_START_SERVERS and not SEQUENTIAL_MODEL_LOADING:
         # Standard mode: start both servers at startup
-        print("\nChecking llama servers...")
+        print("\nStarting llama servers...")
         _start_llama_servers()
-        ocr_ok = check_vlm_server()
-        trans_ok = check_translate_server() if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt") and not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm") else True
-        print(f"  OCR Server (8080): {'Running' if ocr_ok else 'Not running'}")
-        if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt") and not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm"):
-            print(f"  Translate Server (8081): {'Running' if trans_ok else 'Not running'}")
+        # _start_llama_servers already reports final status with proper health checks
     elif needs_llama() and SEQUENTIAL_MODEL_LOADING:
         # Sequential mode: servers started on demand per request
         print("\n[Sequential Mode] llama servers will start/stop on demand per request")

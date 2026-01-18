@@ -23,6 +23,9 @@ from config import (
     download_mmproj, build_llama_command, get_llama_context_size, get_llama_gpu_layers
 )
 
+# Module-level model name (for export)
+VLM_MODEL = os.environ.get('VLM_MODEL', get_ocr_model())
+
 # Grid separator colors (RGB)
 COL_SEP_COLOR = (0, 100, 255)   # Blue - vertical lines between columns
 ROW_SEP_COLOR = (255, 50, 50)   # Red - horizontal lines between rows

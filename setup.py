@@ -264,7 +264,7 @@ def setup_llama():
         # Linux/Windows with NVIDIA GPU - need CUDA and dev libraries
         install_instructions = (
             "[bold]1. Install dependencies:[/]\n"
-            "  [cyan]sudo apt install libcurl4-openssl-dev libssl-dev[/]\n\n"
+            "  [cyan]sudo apt install libcurl4-openssl-dev libssl-dev ccache[/]\n\n"
             "[bold]2. Build from source (with CUDA):[/]\n"
             "  [cyan]git clone https://github.com/ggerganov/llama.cpp[/]\n"
             "  [cyan]cd llama.cpp[/]\n"
@@ -281,7 +281,7 @@ def setup_llama():
         # Linux/Windows without NVIDIA - CPU only
         install_instructions = (
             "[bold]1. Install dependencies:[/]\n"
-            "  [cyan]sudo apt install libcurl4-openssl-dev libssl-dev[/]\n\n"
+            "  [cyan]sudo apt install libcurl4-openssl-dev libssl-dev ccache[/]\n\n"
             "[bold]2. Build from source:[/]\n"
             "  [cyan]git clone https://github.com/ggerganov/llama.cpp[/]\n"
             "  [cyan]cd llama.cpp[/]\n"
@@ -712,7 +712,7 @@ def show_next_steps():
         elif shutil.which('nvidia-smi'):
             steps += (
                 "[bold]Install llama.cpp (with CUDA):[/]\n"
-                "  [cyan]sudo apt install libcurl4-openssl-dev libssl-dev[/]\n"
+                "  [cyan]sudo apt install libcurl4-openssl-dev libssl-dev ccache[/]\n"
                 "  [cyan]git clone https://github.com/ggerganov/llama.cpp[/]\n"
                 "  [cyan]cd llama.cpp && cmake -B build -DGGML_CUDA=ON[/]\n"
                 "  [cyan]cmake --build build --config Release -j[/]\n\n"
@@ -720,7 +720,7 @@ def show_next_steps():
         else:
             steps += (
                 "[bold]Install llama.cpp:[/]\n"
-                "  [cyan]sudo apt install libcurl4-openssl-dev libssl-dev[/]\n"
+                "  [cyan]sudo apt install libcurl4-openssl-dev libssl-dev ccache[/]\n"
                 "  [cyan]git clone https://github.com/ggerganov/llama.cpp[/]\n"
                 "  [cyan]cd llama.cpp && cmake -B build[/]\n"
                 "  [cyan]cmake --build build --config Release -j[/]\n\n"
