@@ -550,59 +550,6 @@ def inpaint_image(img_array: np.ndarray, bubbles: List[Dict], inpainter: Inpaint
     return img_array, stats
 
 
-def inpaint_ocr_bboxes(img: Image.Image, bubbles: List[Dict], inpainter: Inpainter,
-                       verbose: bool = False) -> Tuple[Image.Image, Dict]:
-    """Inpaint OCR text bboxes within bubbles (L1) using bbox masks.
-
-    Note: L1 uses OCR bboxes directly (no text segmentation needed).
-    Text segmentation is only for L2 (text-free regions).
-
-    Args:
-        img: PIL Image to inpaint
-        bubbles: List of bubble dicts with 'texts' containing OCR bboxes
-        inpainter: Inpainter instance
-        verbose: If True, log each inpaint operation
-
-    Returns:
-        Tuple of (Inpainted PIL Image, stats dict)
-    """
-    img_array = np.array(img)
-    inpainter.reset_stats()
-
-    total_text_regions = sum(len(b.get('texts', [])) for b in bubbles)
-
-    if verbose:
-        print(f"  [Inpaint L1] Processing {len(bubbles)} bubbles, {total_text_regions} text regions (bbox)...")
-
-    for bubble in bubbles:
-        texts = bubble.get('texts', [])
-        if not texts:
-            continue
-
-        bubble_box = bubble.get('bubble_box', [0, 0, img.width, img.height])
-        bx1, by1, bx2, by2 = bubble_box
-        margin = 3
-        safe_bx1, safe_by1 = bx1 + margin, by1 + margin
-        safe_bx2, safe_by2 = bx2 - margin, by2 - margin
-
-        for text_item in texts:
-            tx1, ty1, tx2, ty2 = text_item['bbox']
-            # Clip to bubble bounds with margin
-            clipped = [max(tx1, safe_bx1), max(ty1, safe_by1),
-                      min(tx2, safe_bx2), min(ty2, safe_by2)]
-            if clipped[2] > clipped[0] and clipped[3] > clipped[1]:
-                # Inpaint using bbox mask
-                coords, result = inpainter(img_array, clipped, verbose=verbose)
-                img_array[coords[0]:coords[1], coords[2]:coords[3]] = result
-
-    stats = inpainter.get_stats()
-
-    if verbose:
-        print(f"  [Inpaint L1] Done: {stats['count']} regions, {stats['total_ms']}ms total, {stats['avg_ms']}ms avg")
-
-    return Image.fromarray(img_array), stats
-
-
 def process_images_label1(images: List[Image.Image], api_key: str = None, output_type: str = "full_page",
                           ocr_translate: bool = False, translate_local: bool = False,
                           inpaint_background: bool = True) -> Tuple[List[Dict], Any, Dict]:
@@ -850,25 +797,9 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
                 print(f"  [Inpaint L2] Failed: {e}")
                 inpainted_images = None
 
-        # Also inpaint OCR text bboxes (label1 text areas)
-        if use_inpaint and inpainted_images:
-            t_l1 = time.time()
-            inpainter = get_inpainter()
-            final_images = []
-            total_regions = 0
-            for page_idx, img in enumerate(inpainted_images):
-                page_bubbles = ocr_data.get(page_idx, [])
-                if page_bubbles:
-                    img, page_stats = inpaint_ocr_bboxes(img, page_bubbles, inpainter, verbose=False)
-                    total_regions += page_stats.get('count', 0)
-                final_images.append(img)
-            inpaint_l1_ms = int((time.time() - t_l1) * 1000)
-            stats["inpaint_l1_ms"] = inpaint_l1_ms
-            stats["inpaint_l1_regions"] = total_regions
-            print(f"  [Inpaint L1] {total_regions} text regions in {inpaint_l1_ms}ms")
-            source_images = final_images
-        else:
-            source_images = inpainted_images if use_inpaint else images
+        # Use L2-inpainted images (or original if no L2 inpainting)
+        # Note: L1 (text bubbles) are NOT inpainted - translated text is rendered directly
+        source_images = inpainted_images if use_inpaint else images
 
         # Extract and return cropped bubble images with positions
         t0 = time.time()
@@ -929,25 +860,9 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
                 print(f"  [Inpaint L2] Failed: {e}")
                 inpainted_images = None
 
-        # Also inpaint OCR text bboxes (label1 text areas)
-        if use_inpaint and inpainted_images:
-            t_l1 = time.time()
-            inpainter = get_inpainter()
-            final_images = []
-            total_regions = 0
-            for page_idx, img in enumerate(inpainted_images):
-                page_bubbles = ocr_data.get(page_idx, [])
-                if page_bubbles:
-                    img, page_stats = inpaint_ocr_bboxes(img, page_bubbles, inpainter, verbose=False)
-                    total_regions += page_stats.get('count', 0)
-                final_images.append(img)
-            inpaint_l1_ms = int((time.time() - t_l1) * 1000)
-            stats["inpaint_l1_ms"] = inpaint_l1_ms
-            stats["inpaint_l1_regions"] = total_regions
-            print(f"  [Inpaint L1] {total_regions} text regions in {inpaint_l1_ms}ms")
-            source_images = final_images
-        else:
-            source_images = inpainted_images if use_inpaint else images
+        # Use L2-inpainted images (or original if no L2 inpainting)
+        # Note: L1 (text bubbles) are NOT inpainted - translated text is rendered directly
+        source_images = inpainted_images if use_inpaint else images
 
         # Render full pages
         t0 = time.time()
