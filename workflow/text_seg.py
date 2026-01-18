@@ -7,7 +7,7 @@ Provides pixel-level text masks for better inpainting quality compared to bbox-o
 import os
 import time
 import numpy as np
-import cv2
+from PIL import Image
 from typing import Tuple, List, Optional
 
 # Default config
@@ -20,8 +20,8 @@ CONFIG = {
 }
 
 
-def letterbox(img, new_shape=(640, 640), auto=False, stride=32):
-    """Resize and pad image to new_shape with stride-multiple padding."""
+def letterbox(img: np.ndarray, new_shape=(640, 640), auto=False, stride=32):
+    """Resize and pad image to new_shape with stride-multiple padding using PIL."""
     shape = img.shape[:2]  # current shape [height, width]
     if isinstance(new_shape, int):
         new_shape = (new_shape, new_shape)
@@ -30,7 +30,7 @@ def letterbox(img, new_shape=(640, 640), auto=False, stride=32):
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
 
     # Compute padding
-    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))  # (width, height)
     dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
 
     if auto:  # minimum rectangle
@@ -39,29 +39,30 @@ def letterbox(img, new_shape=(640, 640), auto=False, stride=32):
     dw /= 2
     dh /= 2
 
+    # Resize using PIL
     if shape[::-1] != new_unpad:
-        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+        pil_img = Image.fromarray(img)
+        pil_img = pil_img.resize(new_unpad, Image.BILINEAR)
+        img = np.array(pil_img)
 
+    # Pad using numpy
     top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
     left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-    img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
+    img = np.pad(img, ((top, bottom), (left, right), (0, 0)), mode='constant', constant_values=114)
 
     return img, r, (int(dw * 2), int(dh * 2))
 
 
 def preprocess(img: np.ndarray, input_size: int = 1024) -> Tuple[np.ndarray, float, int, int]:
     """Preprocess image for text segmentation model."""
-    # Convert BGR to RGB if needed
-    if len(img.shape) == 3 and img.shape[2] == 3:
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    else:
-        img_rgb = img
+    # Input is RGB numpy array (from PIL or server)
+    img_rgb = img
 
     # Letterbox resize
     img_in, ratio, (dw, dh) = letterbox(img_rgb, new_shape=(input_size, input_size), auto=False, stride=64)
 
     # HWC to CHW, normalize
-    img_in = img_in.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+    img_in = img_in.transpose((2, 0, 1))  # HWC to CHW
     img_in = np.ascontiguousarray(img_in).astype(np.float32) / 255.0
     img_in = img_in[np.newaxis, ...]  # Add batch dimension
 
@@ -78,12 +79,12 @@ def postprocess_mask(mask: np.ndarray, dw: int, dh: int, orig_size: Tuple[int, i
     if dw > 0:
         mask = mask[:, :-dw]
 
-    # Resize to original
+    # Resize to original using PIL
     im_h, im_w = orig_size
-    mask = cv2.resize(mask, (im_w, im_h), interpolation=cv2.INTER_LINEAR)
+    mask_pil = Image.fromarray((mask * 255).astype(np.uint8))
+    mask_pil = mask_pil.resize((im_w, im_h), Image.BILINEAR)
+    mask = np.array(mask_pil)
 
-    # Threshold and convert to uint8
-    mask = (mask * 255).astype(np.uint8)
     return mask
 
 
@@ -188,8 +189,8 @@ class TextSegmenter:
         # Run segmentation on region
         mask = self(region, verbose=False)
 
-        # Threshold to binary
-        _, binary_mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+        # Threshold to binary using numpy
+        binary_mask = np.where(mask > 127, 255, 0).astype(np.uint8)
 
         elapsed = time.time() - t0
         if verbose or (verbose is None and self.verbose):

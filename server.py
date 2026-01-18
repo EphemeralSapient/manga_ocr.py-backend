@@ -534,8 +534,6 @@ def inpaint_ocr_bboxes(img: Image.Image, bubbles: List[Dict], inpainter: Inpaint
     Returns:
         Tuple of (Inpainted PIL Image, stats dict)
     """
-    import cv2
-
     img_array = np.array(img)
     inpainter.reset_stats()
 

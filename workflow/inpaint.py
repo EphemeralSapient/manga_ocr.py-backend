@@ -59,10 +59,11 @@ def get_crop_with_mask(img, bbox, pixel_mask, pad=5):
     bbox_h, bbox_w = y2 - y1, x2 - x1
     mask_h, mask_w = pixel_mask.shape[:2]
 
-    # Resize pixel_mask if needed to match bbox size
+    # Resize pixel_mask if needed to match bbox size (using PIL)
     if mask_h != bbox_h or mask_w != bbox_w:
-        import cv2
-        pixel_mask = cv2.resize(pixel_mask, (bbox_w, bbox_h), interpolation=cv2.INTER_LINEAR)
+        mask_pil = Image.fromarray(pixel_mask)
+        mask_pil = mask_pil.resize((bbox_w, bbox_h), Image.BILINEAR)
+        pixel_mask = np.array(mask_pil)
 
     # Convert to float and place in correct position
     mask_float = pixel_mask.astype(np.float32) / 255.0
