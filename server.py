@@ -809,9 +809,14 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
         translations = translate_texts(all_texts, api_key=api_key, stats=stats)
         # Count successful translations
         success_count = sum(1 for t in translations if t and not t.startswith("["))
+        no_text_count = sum(1 for t in translations if t == "[NO TEXT]")
+        failed_count = sum(1 for t in translations if t == "[TRANSLATION FAILED]")
+        empty_count = sum(1 for t in translations if not t)
         stats["translations_success"] = success_count
         stats["translations_failed"] = len(translations) - success_count
+        stats["translations_no_text"] = no_text_count
         stats["translate_method"] = "cerebras_api"
+        print(f"  [Translate] Results: {success_count} success, {no_text_count} [NO TEXT], {failed_count} failed, {empty_count} empty")
 
     # Sequential model loading: stop translate server after translation is done
     if SEQUENTIAL_MODEL_LOADING and uses_local_translate and not is_already_translated:

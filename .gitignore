@@ -14,6 +14,9 @@ output/*
 *.engine
 *.timing
 
+# CoreML cache
+.coreml_cache/
+
 .env
 data/
 .llama_logs/

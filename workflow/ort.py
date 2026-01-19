@@ -51,8 +51,9 @@ PROVIDER_PRIORITY = [
     ('CPUExecutionProvider', 'CPU'),
 ]
 
-# TensorRT cache directory (for pre-compiled engines)
+# Cache directories (for pre-compiled engines)
 TRT_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.trt_cache')
+COREML_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.coreml_cache')
 
 # Provider-specific configurations
 PROVIDER_CONFIGS = {
@@ -84,6 +85,12 @@ PROVIDER_CONFIGS = {
     },
     'OpenVINOExecutionProvider': {
         'device_type': 'GPU_FP16',
+    },
+    'CoreMLExecutionProvider': {
+        'ModelFormat': 'MLProgram',   # MLProgram (iOS 15+/macOS 12+) or NeuralNetwork (iOS 13+/macOS 10.15+)
+        'MLComputeUnits': 'ALL',      # ALL, CPUOnly, CPUAndGPU, or CPUAndNeuralEngine
+        'EnableOnSubgraphs': '1',     # Enable on subgraphs in control flow ops for better performance
+        'ModelCacheDirectory': COREML_CACHE_DIR,
     },
 }
 
@@ -180,9 +187,11 @@ def create_session(
     # Build provider list with configs
     if provider in PROVIDER_CONFIGS:
         config = {**PROVIDER_CONFIGS[provider], **kwargs}
-        # Ensure TensorRT cache directory exists
+        # Ensure cache directories exist
         if 'trt_engine_cache_path' in config:
             os.makedirs(config['trt_engine_cache_path'], exist_ok=True)
+        if 'ModelCacheDirectory' in config:
+            os.makedirs(config['ModelCacheDirectory'], exist_ok=True)
         providers = [(provider, config)]
     else:
         providers = [provider]

@@ -34,7 +34,7 @@ DEFAULT_API_KEY = _CONFIG_API_KEY or os.environ.get("CEREBRAS_API_KEY", "")
 # Translation config
 BATCH_SIZE = 100
 MAX_WORKERS = 5
-MODEL = "gpt-oss-120b"
+MODEL = "llama-3.3-70b"  # Same model as test - works reliably
 
 SYSTEM_PROMPT = """You are a Japanese to English translator for manga. Translate each numbered Japanese text to English accurately. Keep the same order. Return translations in the translated array WITHOUT numbers. If the input is meaningless (single random characters, sound effects like 'ぎゅっ', symbols, or gibberish that doesn't form proper text), return [NO TEXT] for that entry."""
 
@@ -51,10 +51,10 @@ def translate_batch(
     try:
         numbered = [f"{i+1}. {t}" for i, t in enumerate(batch)]
         # Log what we're sending
-        input_preview = json.dumps(numbered[:3], ensure_ascii=False)
-        if len(numbered) > 3:
-            input_preview = input_preview[:-1] + f', ... +{len(numbered)-3} more]'
-        print(f"    [Translate] Batch {batch_idx} sending {len(batch)} texts: {input_preview[:200]}")
+        input_preview = json.dumps(numbered[:5], ensure_ascii=False)
+        if len(numbered) > 5:
+            input_preview = input_preview[:-1] + f', ... +{len(numbered)-5} more]'
+        print(f"    [Translate] Batch {batch_idx} sending {len(batch)} texts: {input_preview[:300]}")
 
         completion = client.chat.completions.create(
             messages=[
@@ -97,6 +97,13 @@ def translate_batch(
 
             result = json.loads(content)
             translations = result.get("translated", [])
+
+            # Log translation breakdown
+            no_text = sum(1 for t in translations if t == "[NO TEXT]")
+            empty = sum(1 for t in translations if not t)
+            actual = len(translations) - no_text - empty
+            print(f"    [Translate] Batch {batch_idx} parsed: {actual} translations, {no_text} [NO TEXT], {empty} empty")
+
             # Pad if needed
             if len(translations) < len(batch):
                 batch_info["status"] = f"partial ({len(translations)}/{len(batch)})"

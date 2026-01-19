@@ -93,7 +93,7 @@ def test_connection(api_key):
             messages=[
                 {"role": "user", "content": "Say 'hello' in Japanese"}
             ],
-            model="llama-3.3-70b",
+            model="llama-3.3-70b",  # Same model used in translate.py
             max_completion_tokens=50,
         )
         response = completion.choices[0].message.content
