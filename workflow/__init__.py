@@ -58,6 +58,20 @@ from .translate import (
     BATCH_SIZE as TRANSLATION_BATCH_SIZE,
 )
 
+# Gemini Translation
+try:
+    from .gemini_translate import (
+        translate_texts_gemini,
+        check_gemini_available as check_gemini_translate_available,
+        BATCH_SIZE as GEMINI_TRANSLATION_BATCH_SIZE,
+    )
+    HAS_GEMINI_TRANSLATE = True
+except ImportError:
+    translate_texts_gemini = None
+    check_gemini_translate_available = lambda: False
+    GEMINI_TRANSLATION_BATCH_SIZE = 33
+    HAS_GEMINI_TRANSLATE = False
+
 # ONNX Runtime
 from .ort import (
     get_best_provider,
@@ -84,6 +98,8 @@ __all__ = [
     'render_text_on_image', 'fit_text', 'get_font',
     # Translation
     'translate_texts', 'TRANSLATION_BATCH_SIZE',
+    'translate_texts_gemini', 'check_gemini_translate_available',
+    'GEMINI_TRANSLATION_BATCH_SIZE', 'HAS_GEMINI_TRANSLATE',
     # ORT
     'get_best_provider', 'get_provider_info', 'create_ort_session',
     'create_session_with_info', 'is_gpu_available', 'is_cuda_available',

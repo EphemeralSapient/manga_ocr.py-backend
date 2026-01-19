@@ -57,6 +57,7 @@ from workflow import create_inpainter, Inpainter
 from workflow import create_text_segmenter, TextSegmenter
 from workflow import render_text_on_image
 from workflow import translate_texts
+from workflow import translate_texts_gemini, HAS_GEMINI_TRANSLATE
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration Loading - Use centralized config module
@@ -93,6 +94,8 @@ TRANSLATE_BATCH_SIZE = get_translation_batch_size()  # Texts per translation bat
 # Always use separate OCR (VLM) + Translation (HunyuanMT or API) flow
 if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt"):
     DEFAULT_TRANSLATE_MODE = "local"  # Use HunyuanMT for translation
+elif TRANSLATE_METHOD == "gemini_translate":
+    DEFAULT_TRANSLATE_MODE = "gemini"  # Use Gemini API for translation
 else:
     DEFAULT_TRANSLATE_MODE = "api"  # Use Cerebras API
 
@@ -803,6 +806,19 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
         stats["translations_success"] = 0
         stats["translations_failed"] = len(all_texts)
         stats["translate_method"] = "none"
+    elif TRANSLATE_METHOD == "gemini_translate" and HAS_GEMINI_TRANSLATE:
+        # Use Gemini API for translation
+        translations = translate_texts_gemini(all_texts, stats=stats)
+        # Count successful translations
+        success_count = sum(1 for t in translations if t and not t.startswith("["))
+        no_text_count = sum(1 for t in translations if t == "[NO TEXT]")
+        failed_count = sum(1 for t in translations if t == "[TRANSLATION FAILED]")
+        empty_count = sum(1 for t in translations if not t)
+        stats["translations_success"] = success_count
+        stats["translations_failed"] = len(translations) - success_count
+        stats["translations_no_text"] = no_text_count
+        stats["translate_method"] = "gemini_api"
+        print(f"  [Translate] Results: {success_count} success, {no_text_count} [NO TEXT], {failed_count} failed, {empty_count} empty")
     else:
         # Use Cerebras API for translation
         print(f"  [Translate] {len(all_texts)} texts using Cerebras API...")
@@ -1074,7 +1090,10 @@ def process_images_label2(images: List[Image.Image], api_key: str = None, output
     # Handle different output types
     if output_type == "text_only":
         # Skip inpainting for text_only mode
-        translations = translate_texts(all_texts, api_key=api_key, stats=stats)
+        if TRANSLATE_METHOD == "gemini_translate" and HAS_GEMINI_TRANSLATE:
+            translations = translate_texts_gemini(all_texts, stats=stats)
+        else:
+            translations = translate_texts(all_texts, api_key=api_key, stats=stats)
 
         # Build translation lookup
         translation_data = {}
@@ -1133,6 +1152,8 @@ def process_images_label2(images: List[Image.Image], api_key: str = None, output
         return inpainted
 
     def do_translation():
+        if TRANSLATE_METHOD == "gemini_translate" and HAS_GEMINI_TRANSLATE:
+            return translate_texts_gemini(all_texts, stats=stats)
         return translate_texts(all_texts, api_key=api_key, stats=stats)
 
     # Note: Label2 uses Cerebras API for translation by default (not local LLM)
@@ -1538,6 +1559,7 @@ def _translate_texts_batch(texts: list, translate_local: bool, api_key: str) -> 
     """
     Translate a batch of texts (TRANSLATE_BATCH_SIZE texts).
     Returns list of translations.
+    Dispatches to local, Gemini, or Cerebras based on TRANSLATE_METHOD config.
     """
     if not texts:
         return []
@@ -1546,6 +1568,9 @@ def _translate_texts_batch(texts: list, translate_local: bool, api_key: str) -> 
         translator = LlmTranslator()
         result = translator.translate(texts)
         return result.get('translations', [''] * len(texts))
+    elif TRANSLATE_METHOD == "gemini_translate" and HAS_GEMINI_TRANSLATE:
+        # Use Gemini API
+        return translate_texts_gemini(texts)
     else:
         # Use Cerebras API
         return translate_texts(texts, api_key=api_key)
