@@ -34,7 +34,7 @@ DEFAULT_API_KEY = _CONFIG_API_KEY or os.environ.get("CEREBRAS_API_KEY", "")
 # Translation config
 BATCH_SIZE = 100
 MAX_WORKERS = 5
-MODEL = "llama-3.3-70b"  # Same model as test - works reliably
+MODEL = "gpt-oss-120b"
 
 SYSTEM_PROMPT = """You are a Japanese to English translator for manga. Translate each numbered Japanese text to English accurately. Keep the same order. Return translations in the translated array WITHOUT numbers. If the input is meaningless (single random characters, sound effects like 'ぎゅっ', symbols, or gibberish that doesn't form proper text), return [NO TEXT] for that entry."""
 
