@@ -108,7 +108,9 @@ def render_text_on_image(
     bubbles: List[Dict],
     translations: Dict[int, str],
     use_inpaint: bool = False,
-    text_segmenter = None
+    text_segmenter = None,
+    precomputed_mask: np.ndarray = None,
+    timing: Dict = None
 ) -> Image.Image:
     """
     Render translated text onto image.
@@ -118,20 +120,31 @@ def render_text_on_image(
         bubbles: List of bubble dicts with 'idx', 'bubble_box', 'texts'
         translations: Dict mapping bubble idx to translated text
         use_inpaint: If True, L2 background was inpainted (informational only)
-        text_segmenter: Optional TextSegmenter for pixel-level text cleaning (L1 bubbles)
+        text_segmenter: Optional TextSegmenter for pixel-level text cleaning (L1 bubbles) - deprecated, use precomputed_mask
+        precomputed_mask: Pre-computed text segmentation mask for this page (faster)
+        timing: Optional dict to accumulate timing stats
 
     Returns:
         Modified PIL Image
     """
+    import time
+    t_start = time.time()
+
     draw = ImageDraw.Draw(img)
     img_array = np.array(img)
-    full_page_mask = None
+    full_page_mask = precomputed_mask  # Use precomputed if available
 
-    # Run text segmentation on FULL PAGE once (much better than per-bubble)
-    # The model needs full page context to detect text accurately
-    if text_segmenter is not None and bubbles:
+    # Fallback: Run text segmentation if no precomputed mask (legacy path)
+    t_seg_start = time.time()
+    if full_page_mask is None and text_segmenter is not None and bubbles:
         full_page_mask = text_segmenter(img_array, verbose=False)
+    t_seg = time.time() - t_seg_start
 
+    if timing is not None:
+        timing['text_seg_ms'] = timing.get('text_seg_ms', 0) + int(t_seg * 1000)
+        timing['text_seg_calls'] = timing.get('text_seg_calls', 0) + (1 if (text_segmenter and bubbles and precomputed_mask is None) else 0)
+
+    t_mask_start = time.time()
     for bubble in bubbles:
         idx = bubble["idx"]
         bubble_box = bubble["bubble_box"]
@@ -169,11 +182,16 @@ def render_text_on_image(
                     draw.rectangle(clipped, fill="white")
         # else: text_segmenter is None = L2 regions already inpainted, skip clearing
 
+    t_mask = time.time() - t_mask_start
+    if timing is not None:
+        timing['mask_apply_ms'] = timing.get('mask_apply_ms', 0) + int(t_mask * 1000)
+
     # Convert back from array
     img = Image.fromarray(img_array)
     draw = ImageDraw.Draw(img)
 
     # Render translated text
+    t_text_start = time.time()
     for bubble in bubbles:
         idx = bubble["idx"]
         bubble_box = bubble["bubble_box"]
@@ -192,6 +210,14 @@ def render_text_on_image(
             text_x = bubble_box[0] + (box_width - text_width) // 2
             text_y = start_y + i * line_height
             draw.text((text_x, text_y), line, fill="black", font=font)
+
+    t_text = time.time() - t_text_start
+    t_total = time.time() - t_start
+
+    if timing is not None:
+        timing['text_render_ms'] = timing.get('text_render_ms', 0) + int(t_text * 1000)
+        timing['render_total_ms'] = timing.get('render_total_ms', 0) + int(t_total * 1000)
+        timing['render_calls'] = timing.get('render_calls', 0) + 1
 
     return img
 

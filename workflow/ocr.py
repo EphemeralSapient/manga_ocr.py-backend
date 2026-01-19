@@ -26,9 +26,19 @@ except:
     VlmOCR, check_vlm_available, create_ocr_grid = None, None, None
     _HAS_VLM_MODULE = False
 
+# Load API-based OCR (Gemini, etc) - cloud alternatives
+try:
+    from .ocr_api import GeminiOCR, check_gemini_available, get_gemini_ocr, reset_gemini_ocr
+    _HAS_GEMINI_MODULE = True
+except:
+    GeminiOCR, check_gemini_available, get_gemini_ocr, reset_gemini_ocr = None, None, None, None
+    _HAS_GEMINI_MODULE = False
+
 _local_ocr = None
 _vlm_ocr = None
+_gemini_ocr = None
 _vlm_checked = False  # Track if we've done runtime check
+_gemini_checked = False
 OCR_URL = "http://localhost:1377/ocr"
 
 
@@ -46,6 +56,15 @@ def reset_vlm_ocr():
             pass
     _vlm_ocr = None
     _vlm_checked = False
+
+
+def reset_api_ocr():
+    """Reset API-based OCR instances (Gemini, etc)."""
+    global _gemini_ocr, _gemini_checked
+    _gemini_ocr = None
+    _gemini_checked = False
+    if _HAS_GEMINI_MODULE and reset_gemini_ocr:
+        reset_gemini_ocr()
 
 
 SKIP_CHARS = {'ノ', 'ー', '一', '|'}
@@ -71,6 +90,7 @@ def _check_vlm_available():
 # For backwards compatibility exports
 HAS_LFM_OCR = _HAS_VLM_MODULE  # Module available (runtime check done in _get_vlm_ocr)
 HAS_VLM_OCR = _HAS_VLM_MODULE
+HAS_GEMINI_OCR = _HAS_GEMINI_MODULE
 HAS_LOCAL_OCR = HAS_WINDOWS_OCR if IS_WINDOWS else HAS_VLM_OCR
 
 
@@ -101,6 +121,34 @@ def _get_vlm_ocr():
         except:
             return None
     return _vlm_ocr
+
+
+def _check_gemini_available():
+    """Check Gemini OCR availability at runtime."""
+    global _gemini_checked
+    if not _HAS_GEMINI_MODULE or check_gemini_available is None:
+        return False
+    if not _gemini_checked:
+        available = check_gemini_available()
+        if available:
+            _gemini_checked = True
+        return available
+    return True
+
+
+def _get_gemini_ocr():
+    """Get Gemini OCR instance (Google AI Studio API)."""
+    global _gemini_ocr
+    if not _HAS_GEMINI_MODULE or GeminiOCR is None:
+        return None
+    if not _check_gemini_available():
+        return None
+    if _gemini_ocr is None:
+        try:
+            _gemini_ocr = GeminiOCR()
+        except:
+            return None
+    return _gemini_ocr
 
 
 def grid_bubbles(bubbles, row_width=1600, padding=10):
@@ -184,10 +232,22 @@ def run_ocr(image, ocr_url=OCR_URL, positions=None, grid_info=None, translate=Fa
                          headers={"Content-Type": "application/octet-stream"}).json()
 
 
+def _get_configured_ocr_method():
+    """Get the configured OCR method from config."""
+    try:
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        from config import get_ocr_method, is_api_ocr_method
+        return get_ocr_method(), is_api_ocr_method(get_ocr_method())
+    except:
+        return "qwen_vlm", False
+
+
 def run_ocr_on_bubbles(bubbles, row_width=1600, padding=10, ocr_url=OCR_URL, translate=False):
     """
     High-level OCR: create grid and run OCR in one call.
 
+    For Gemini API: Sends individual bubble images directly (no grid needed).
     For VLM OCR: Uses colored separator grid with batched processing.
     For Windows/HTTP: Uses standard grid.
 
@@ -196,10 +256,26 @@ def run_ocr_on_bubbles(bubbles, row_width=1600, padding=10, ocr_url=OCR_URL, tra
         row_width: Max width for grid rows
         padding: Padding between cells
         ocr_url: URL for HTTP OCR fallback
-        translate: If True and using VLM, output English translations directly
+        translate: If True and using VLM/API, output English translations directly
 
     Returns: (ocr_result, positions, grid_image)
     """
+    ocr_method, is_api = _get_configured_ocr_method()
+
+    # Try Gemini API OCR if configured
+    if is_api and ocr_method == "gemini_api":
+        gemini = _get_gemini_ocr()
+        if gemini:
+            try:
+                # Gemini sends individual images, no grid needed
+                ocr_result, positions, _ = gemini.run_batched(
+                    bubbles, row_width=row_width, padding=padding, translate=translate
+                )
+                return ocr_result, positions, None
+            except Exception as e:
+                print(f"[OCR] Gemini API error: {e}")
+                # Fall through to try VLM or other backends
+
     # Use VLM OCR with batched processing (faster, handles many bubbles)
     vlm = _get_vlm_ocr()
     if vlm and create_ocr_grid is not None:
@@ -213,10 +289,10 @@ def run_ocr_on_bubbles(bubbles, row_width=1600, padding=10, ocr_url=OCR_URL, tra
             print(f"[OCR] VLM error: {e}")
             pass
 
-    # Translate mode requires VLM
+    # Translate mode requires VLM or API OCR
     if translate:
         grid_img, positions = grid_bubbles(bubbles, row_width, padding)
-        return {'lines': [], 'line_count': 0, 'error': 'Translate mode requires VLM OCR (check llama-server)', 'translated': False}, positions, grid_img
+        return {'lines': [], 'line_count': 0, 'error': 'Translate mode requires VLM or API OCR', 'translated': False}, positions, grid_img
 
     # Standard grid for Windows OCR or HTTP fallback
     grid_img, positions = grid_bubbles(bubbles, row_width, padding)

@@ -56,7 +56,7 @@ DEFAULT_CONFIG = {
     # User Settings (shown in wizard)
     # ══════════════════════════════════════════════════════════════════════════
 
-    # OCR method: "qwen_vlm" | "lfm_vlm" | "ministral_vlm_q8" | "oneocr"
+    # OCR method: "qwen_vlm" | "lfm_vlm" | "ministral_vlm_q8" | "gemini_api" | "oneocr"
     "ocr_method": "qwen_vlm",
 
     # Translation method: "hunyuan_mt" | "cerebras_api"
@@ -85,6 +85,15 @@ DEFAULT_CONFIG = {
     "ocr_mmproj": "", # Leave empty to auto-select (always Q8 for vision encoder)
     "translate_model": "tencent/HY-MT1.5-1.8B-GGUF:HY-MT1.5-1.8B-Q4_K_M.gguf",
     "cerebras_api_key": "",
+
+    # Gemma/Gemini API settings (for gemini_api OCR and gemini_translate methods)
+    # Uses Google AI Studio API - get key at https://aistudio.google.com/apikey
+    "gemini_api_key": "",
+    "gemini_model": "gemma-3-27b-it",           # OCR model options:
+                                                 # - gemma-3-27b-it (14.4k req/day - RECOMMENDED)
+                                                 # - gemini-2.5-flash-lite (20 req/day - limited)
+                                                 # - gemini-3-flash-preview (20 req/day - limited)
+    "gemini_translate_model": "gemma-3-27b-it", # Translation model (same options as above)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Server Settings (config.json only)
@@ -284,6 +293,15 @@ def get_translate_model() -> str:
 def get_cerebras_api_key() -> str:
     return get("cerebras_api_key", "")
 
+def get_gemini_api_key() -> str:
+    return get("gemini_api_key", "")
+
+def get_gemini_model() -> str:
+    return get("gemini_model", "gemma-3-27b-it")
+
+def get_gemini_translate_model() -> str:
+    return get("gemini_translate_model", "gemma-3-27b-it")
+
 # Server settings
 def get_ocr_server_url() -> str:
     return get("ocr_server_url", "http://localhost:8080")
@@ -357,19 +375,31 @@ def needs_llama() -> bool:
     """Check if current config needs llama.cpp."""
     ocr = get_ocr_method()
     translate = get_translate_method()
-    vlm_methods = ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8")
-    return ocr in vlm_methods or translate in ("qwen_vlm", "hunyuan_mt")
+    # API-based OCR doesn't need llama.cpp
+    if ocr in API_OCR_METHODS:
+        ocr_needs_llama = False
+    else:
+        ocr_needs_llama = ocr in VLM_METHODS
+    translate_needs_llama = translate in ("qwen_vlm", "hunyuan_mt")
+    return ocr_needs_llama or translate_needs_llama
 
 def uses_same_model_for_ocr_and_translate() -> bool:
     """Check if OCR and translation use the same model."""
     return get_ocr_method() == "qwen_vlm" and get_translate_method() == "qwen_vlm"
 
-# VLM method constants
+# VLM method constants (local llama.cpp based)
 VLM_METHODS = ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8")
 
+# API-based OCR methods (cloud services, no local GPU needed)
+API_OCR_METHODS = ("gemini_api",)
+
 def is_vlm_method(method: str) -> bool:
-    """Check if method is a VLM-based method."""
+    """Check if method is a local VLM-based method (needs llama.cpp)."""
     return method in VLM_METHODS
+
+def is_api_ocr_method(method: str) -> bool:
+    """Check if method is an API-based OCR method (cloud service)."""
+    return method in API_OCR_METHODS
 
 def get_target_language_name() -> str:
     """Get the full name of the target language."""
@@ -588,52 +618,192 @@ def run_wizard() -> dict:
 
     try:
         # ══════════════════════════════════════════════════════════════════════
-        # Step 1: OCR Method
+        # Step 1: Setup Type (Local / API / Mixed)
         # ══════════════════════════════════════════════════════════════════════
-        console.print("\n[bold cyan]Step 1: OCR Method[/]")
-        console.print("[dim]Choose how to extract text from images[/]")
+        console.print("\n[bold cyan]Step 1: Setup Type[/]")
+        console.print("[dim]Choose how OCR and Translation will be processed[/]")
 
-        ocr_options = [
-            ("qwen_vlm", f"Qwen 3 VL 2B - Vision model for OCR [cyan](~2.3GB VRAM)[/]"),
-            ("lfm_vlm", f"LFM 2.5 VL 1.6B - Smaller & faster [cyan](~1.7GB VRAM)[/]"),
-            ("ministral_vlm_q8", f"Ministral 3B Q8 - Best quality [cyan](~4.5GB VRAM)[/]"),
+        console.print(Panel(
+            "[bold]Local[/]\n"
+            "  [green]+[/] No API keys needed, fully offline\n"
+            "  [green]+[/] No rate limits or usage costs\n"
+            "  [green]+[/] Privacy - data stays on your machine\n"
+            "  [red]-[/] Requires [yellow]llama.cpp[/] compilation (time & resource intensive)\n"
+            "  [red]-[/] Needs GPU with sufficient VRAM (1.7-5.6GB)\n"
+            "  [red]-[/] Slower than cloud APIs on weak hardware\n\n"
+            "[bold]API[/]\n"
+            "  [green]+[/] No local GPU required\n"
+            "  [green]+[/] Fast processing (cloud infrastructure)\n"
+            "  [green]+[/] No llama.cpp compilation needed\n"
+            "  [red]-[/] Requires API keys (free tiers available)\n"
+            "  [red]-[/] Rate limits apply (varies by provider)\n"
+            "  [red]-[/] Data sent to cloud servers\n\n"
+            "[bold]Mixed[/]\n"
+            "  [green]+[/] Best of both worlds - flexibility\n"
+            "  [green]+[/] Use local for one task, API for another\n"
+            "  [red]-[/] May still need llama.cpp for local parts",
+            title="[bold]Pros & Cons[/]",
+            border_style="dim"
+        ))
+
+        setup_options = [
+            ("local", "Local - Run everything on your machine [cyan](needs llama.cpp + GPU)[/]"),
+            ("api", "API - Use cloud services [yellow](needs API keys, no GPU required)[/]"),
+            ("mixed", "Mixed - Combine local and cloud [dim](choose per task)[/]"),
+        ]
+
+        # Detect current setup type from config
+        current_ocr = cfg.get("ocr_method", "qwen_vlm")
+        current_translate = cfg.get("translate_method", "hunyuan_mt")
+        ocr_is_api = current_ocr in API_OCR_METHODS
+        translate_is_api = current_translate in ("cerebras_api", "gemini_translate")
+
+        if ocr_is_api and translate_is_api:
+            current_setup = "api"
+        elif not ocr_is_api and not translate_is_api:
+            current_setup = "local"
+        else:
+            current_setup = "mixed"
+
+        default_idx = next((i for i, (k, _) in enumerate(setup_options) if k == current_setup), 0)
+        setup_type = prompt_choice("Select setup type:", setup_options, default=default_idx)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # Step 2: OCR Method (filtered by setup type)
+        # ══════════════════════════════════════════════════════════════════════
+        console.print("\n[bold cyan]Step 2: OCR Method[/]")
+        console.print("[dim]Choose how to extract text from manga/comic images[/]")
+
+        # Build OCR options based on setup type
+        local_ocr_options = [
+            ("qwen_vlm", "Qwen 3 VL 2B [cyan](~2.3GB VRAM)[/] - Good balance"),
+            ("lfm_vlm", "LFM 2.5 VL 1.6B [cyan](~1.7GB VRAM)[/] - Smallest, fastest"),
+            ("ministral_vlm_q8", "Ministral 3B Q8 [cyan](~4.5GB VRAM)[/] - Best local quality"),
+        ]
+
+        api_ocr_options = [
+            ("gemini_api:gemma-3-27b-it", "Gemma 3 27B IT [green](14.4k req/day)[/] - Best for free tier"),
+            ("gemini_api:gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite [red](20 req/day)[/] - Fast but limited"),
+            ("gemini_api:gemini-3-flash-preview", "Gemini 3 Flash Preview [red](20 req/day)[/] - Newest but limited"),
         ]
 
         if PY == 'Windows':
-            ocr_options.insert(0, ("oneocr", "OneOCR - Fastest & most accurate [green](no VRAM, Windows only)[/]"))
+            local_ocr_options.insert(0, ("oneocr", "OneOCR [green](no VRAM, Windows only)[/] - Fastest & most accurate"))
 
-        current_ocr = cfg.get("ocr_method", "qwen_vlm")
-        default_idx = next((i for i, (k, _) in enumerate(ocr_options) if k == current_ocr), 0)
+        if setup_type == "local":
+            ocr_options = local_ocr_options
+            console.print("[dim]Local models require llama.cpp and GPU VRAM[/]")
+        elif setup_type == "api":
+            ocr_options = api_ocr_options
+            console.print(Panel(
+                "[bold]API Rate Limits (Free Tier):[/]\n"
+                "  [green]gemma-3-27b-it[/]: 14,400 requests/day - [bold]Recommended for free use[/]\n"
+                "  [red]gemini-2.5-flash-lite[/]: 20 requests/day - Too limited for practical use\n"
+                "  [red]gemini-3-flash-preview[/]: 20 requests/day - Too limited for practical use\n\n"
+                "[dim]Get API key at: https://aistudio.google.com/apikey[/]",
+                title="[yellow]Rate Limits[/]",
+                border_style="yellow"
+            ))
+        else:  # mixed
+            ocr_options = local_ocr_options + api_ocr_options
 
-        ocr_method = prompt_choice("Select OCR method:", ocr_options, default=default_idx)
-        cfg["ocr_method"] = ocr_method
+        # Find current selection in options
+        current_ocr_key = current_ocr
+        if current_ocr == "gemini_api":
+            current_model = cfg.get("gemini_model", "gemma-3-27b-it")
+            current_ocr_key = f"gemini_api:{current_model}"
+
+        default_idx = 0
+        for i, (k, _) in enumerate(ocr_options):
+            if k == current_ocr_key or k == current_ocr:
+                default_idx = i
+                break
+
+        ocr_choice = prompt_choice("Select OCR method:", ocr_options, default=default_idx)
+
+        # Parse OCR choice (handle gemini_api:model format)
+        if ocr_choice.startswith("gemini_api:"):
+            cfg["ocr_method"] = "gemini_api"
+            cfg["gemini_model"] = ocr_choice.split(":", 1)[1]
+        else:
+            cfg["ocr_method"] = ocr_choice
+
+        # Gemini API key if using gemini_api OCR
+        if cfg["ocr_method"] == "gemini_api":
+            console.print("[dim]Input is hidden for security - just type and press Enter[/]")
+            cfg["gemini_api_key"] = prompt_input(
+                "Gemini API Key (from aistudio.google.com/apikey)",
+                cfg.get("gemini_api_key", ""),
+                secret=True
+            )
+            if not cfg["gemini_api_key"]:
+                warn("No Gemini API key set - add it to config.json or set GEMINI_API_KEY env var")
 
         # ══════════════════════════════════════════════════════════════════════
-        # Step 2: Translation Method
+        # Step 3: Translation Method (filtered by setup type)
         # ══════════════════════════════════════════════════════════════════════
-        console.print("\n[bold cyan]Step 2: Translation Method[/]")
+        console.print("\n[bold cyan]Step 3: Translation Method[/]")
         console.print("[dim]Choose how to translate extracted text[/]")
 
-        translate_options = []
+        local_translate_options = [
+            ("hunyuan_mt", "HunyuanMT [cyan](~1.1GB VRAM)[/] - Dedicated MT model, good quality"),
+        ]
 
-        # Note: VLM translation disabled due to Qwen 3 VL hallucination issues
-        # Always use separate translation model
+        api_translate_options = [
+            ("cerebras_api", "Cerebras API [green](1M tokens/day)[/] - Fastest (1-2s), best quality"),
+            ("gemini_translate:gemma-3-27b-it", "Gemma 3 27B IT [green](14.4k req/day)[/] - Good for free tier"),
+            ("gemini_translate:gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite [red](20 req/day)[/] - Limited"),
+            ("gemini_translate:gemini-3-flash-preview", "Gemini 3 Flash Preview [red](20 req/day)[/] - Limited"),
+        ]
 
-        translate_options.extend([
-            ("hunyuan_mt", f"HunyuanMT - Dedicated translator [cyan](~1.1GB VRAM)[/]"),
-            ("cerebras_api", f"Cerebras API - Cloud LLM, best quality [yellow](needs API key)[/]"),
-        ])
+        if setup_type == "local":
+            translate_options = local_translate_options
+            console.print("[dim]Local translation requires llama.cpp and GPU VRAM[/]")
+        elif setup_type == "api":
+            translate_options = api_translate_options
+            console.print(Panel(
+                "[bold]API Rate Limits (Free Tier):[/]\n"
+                "  [green]Cerebras[/]: 1 million tokens/day, [bold]1-2 second response[/] - [bold]RECOMMENDED[/]\n"
+                "  [green]gemma-3-27b-it[/]: 14,400 requests/day - Good alternative\n"
+                "  [red]gemini-2.5/3-flash[/]: 20 requests/day - Too limited\n\n"
+                "[dim]Cerebras key: https://cloud.cerebras.ai/[/]\n"
+                "[dim]Gemini key: https://aistudio.google.com/apikey[/]",
+                title="[yellow]Rate Limits[/]",
+                border_style="yellow"
+            ))
+        else:  # mixed
+            translate_options = local_translate_options + api_translate_options
 
-        current_translate = cfg.get("translate_method", "hunyuan_mt")
-        default_idx = next((i for i, (k, _) in enumerate(translate_options) if k == current_translate), 0)
+        # Find current selection
+        current_translate_key = current_translate
+        default_idx = 0
+        for i, (k, _) in enumerate(translate_options):
+            if k == current_translate_key or k == current_translate:
+                default_idx = i
+                break
 
-        translate_method = prompt_choice("Select translation method:", translate_options, default=default_idx)
-        cfg["translate_method"] = translate_method
+        translate_choice = prompt_choice("Select translation method:", translate_options, default=default_idx)
 
-        # API key if needed
-        if translate_method == "cerebras_api":
+        # Parse translation choice
+        if translate_choice.startswith("gemini_translate:"):
+            cfg["translate_method"] = "gemini_translate"
+            cfg["gemini_translate_model"] = translate_choice.split(":", 1)[1]
+            # Ensure we have API key for Gemini translation
+            if not cfg.get("gemini_api_key"):
+                console.print("[dim]Input is hidden for security - just type and press Enter[/]")
+                cfg["gemini_api_key"] = prompt_input(
+                    "Gemini API Key (from aistudio.google.com/apikey)",
+                    cfg.get("gemini_api_key", ""),
+                    secret=True
+                )
+        else:
+            cfg["translate_method"] = translate_choice
+
+        # API key for Cerebras
+        if cfg["translate_method"] == "cerebras_api":
+            console.print("[dim]Input is hidden for security - just type and press Enter[/]")
             cfg["cerebras_api_key"] = prompt_input(
-                "Cerebras API Key",
+                "Cerebras API Key (from cloud.cerebras.ai)",
                 cfg.get("cerebras_api_key", ""),
                 secret=True
             )
@@ -641,9 +811,9 @@ def run_wizard() -> dict:
                 warn("No API key set - add it to config.json later")
 
         # ══════════════════════════════════════════════════════════════════════
-        # Step 3: Target Language
+        # Step 4: Target Language
         # ══════════════════════════════════════════════════════════════════════
-        console.print("\n[bold cyan]Step 3: Target Language[/]")
+        console.print("\n[bold cyan]Step 4: Target Language[/]")
         console.print("[dim]Language to translate manga into[/]")
 
         lang_options = [(code, name) for code, name in LANGUAGES.items()]
@@ -654,9 +824,9 @@ def run_wizard() -> dict:
         cfg["target_language"] = target_lang
 
         # ══════════════════════════════════════════════════════════════════════
-        # Step 4: Server Settings
+        # Step 5: Server Settings
         # ══════════════════════════════════════════════════════════════════════
-        console.print("\n[bold cyan]Step 4: Server Settings[/]")
+        console.print("\n[bold cyan]Step 5: Server Settings[/]")
 
         cfg["server_port"] = int(prompt_input(
             "Server port",
@@ -706,14 +876,20 @@ def show_vram_estimate(cfg: dict):
     elif ocr == "ministral_vlm_q8":
         ocr_vram = 4.5  # Q8_0 ~3.65GB + mmproj ~0.85GB
         components.append("Ministral Q8 ~4.5GB (OCR)")
+    elif ocr == "gemini_api":
+        model = cfg.get("gemini_model", "gemma-3-27b-it")
+        components.append(f"Gemini API: {model} (cloud, no VRAM)")
     elif ocr == "oneocr":
         components.append("OneOCR (no VRAM)")
 
     if translate == "hunyuan_mt":
         translate_vram = 1.1
-        components.append("HunyuanMT ~1.1GB")
+        components.append("HunyuanMT ~1.1GB (Translation)")
     elif translate == "cerebras_api":
-        components.append("Cerebras API (cloud)")
+        components.append("Cerebras API (cloud, 1M tokens/day)")
+    elif translate == "gemini_translate":
+        model = cfg.get("gemini_translate_model", "gemma-3-27b-it")
+        components.append(f"Gemini Translate: {model} (cloud, no VRAM)")
 
     # Calculate total based on sequential mode
     if sequential and ocr_vram > 0 and translate_vram > 0:
@@ -721,10 +897,12 @@ def show_vram_estimate(cfg: dict):
         total_vram = max(ocr_vram, translate_vram)
         console.print(f"\n[bold]Estimated VRAM:[/] [cyan]~{total_vram}GB[/] [dim](sequential mode - one model at a time)[/]")
         console.print(f"  [dim]• Peak usage: ~{total_vram}GB (larger of OCR/translate)[/]")
-    else:
+    elif ocr_vram > 0 or translate_vram > 0:
         # Parallel: both models loaded
         total_vram = ocr_vram + translate_vram
         console.print(f"\n[bold]Estimated VRAM:[/] [cyan]~{total_vram}GB[/]")
+    else:
+        console.print(f"\n[bold]Estimated VRAM:[/] [green]0GB (all cloud APIs)[/]")
 
     for c in components:
         console.print(f"  [dim]• {c}[/]")
@@ -745,13 +923,39 @@ def show_summary(cfg: dict):
     lang = cfg.get("target_language", "en")
     sequential = cfg.get("sequential_model_loading", False)
 
-    ocr_names = {"qwen_vlm": "Qwen 3 VL", "lfm_vlm": "LFM 2.5 VL", "ministral_vlm_q8": "Ministral 3B Q8", "oneocr": "OneOCR"}
-    translate_names = {"qwen_vlm": "Qwen 3 VL", "hunyuan_mt": "HunyuanMT", "cerebras_api": "Cerebras API"}
+    ocr_names = {
+        "qwen_vlm": "Qwen 3 VL",
+        "lfm_vlm": "LFM 2.5 VL",
+        "ministral_vlm_q8": "Ministral 3B Q8",
+        "gemini_api": "Gemini API",
+        "oneocr": "OneOCR"
+    }
+    translate_names = {
+        "qwen_vlm": "Qwen 3 VL",
+        "hunyuan_mt": "HunyuanMT",
+        "cerebras_api": "Cerebras API",
+        "gemini_translate": "Gemini API"
+    }
 
-    table.add_row("OCR", f"[bold]{ocr_names.get(ocr, ocr)}[/]")
-    table.add_row("Translation", f"[bold]{translate_names.get(translate, translate)}[/]")
+    # OCR row
+    ocr_display = ocr_names.get(ocr, ocr)
+    if ocr == "gemini_api":
+        model = cfg.get("gemini_model", "gemma-3-27b-it")
+        ocr_display = f"Gemini API ({model})"
+    table.add_row("OCR", f"[bold]{ocr_display}[/]")
+    if ocr == "gemini_api":
+        table.add_row("  API Key", "[green]Set[/]" if cfg.get("gemini_api_key") else "[yellow]Not set[/]")
+
+    # Translation row
+    translate_display = translate_names.get(translate, translate)
+    if translate == "gemini_translate":
+        model = cfg.get("gemini_translate_model", "gemma-3-27b-it")
+        translate_display = f"Gemini API ({model})"
+    table.add_row("Translation", f"[bold]{translate_display}[/]")
     if translate == "cerebras_api":
         table.add_row("  API Key", "[green]Set[/]" if cfg.get("cerebras_api_key") else "[yellow]Not set[/]")
+    elif translate == "gemini_translate":
+        table.add_row("  API Key", "[green]Set[/]" if cfg.get("gemini_api_key") else "[yellow]Not set[/]")
 
     table.add_row("", "")
     table.add_row("Target Language", f"[bold]{LANGUAGES.get(lang, lang)}[/]")

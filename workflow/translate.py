@@ -19,8 +19,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Default API key from environment
-DEFAULT_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
+# Import config to get API key from config.json
+try:
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from config import get_cerebras_api_key
+    _CONFIG_API_KEY = get_cerebras_api_key()
+except ImportError:
+    _CONFIG_API_KEY = None
+
+# Default API key: config.json first, then environment variable
+DEFAULT_API_KEY = _CONFIG_API_KEY or os.environ.get("CEREBRAS_API_KEY", "")
 
 # Translation config
 BATCH_SIZE = 100
@@ -41,6 +50,12 @@ def translate_batch(
 
     try:
         numbered = [f"{i+1}. {t}" for i, t in enumerate(batch)]
+        # Log what we're sending
+        input_preview = json.dumps(numbered[:3], ensure_ascii=False)
+        if len(numbered) > 3:
+            input_preview = input_preview[:-1] + f', ... +{len(numbered)-3} more]'
+        print(f"    [Translate] Batch {batch_idx} sending {len(batch)} texts: {input_preview[:200]}")
+
         completion = client.chat.completions.create(
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -74,24 +89,43 @@ def translate_batch(
         )
         content = completion.choices[0].message.content
         batch_info["time_ms"] = int((time.time() - batch_start) * 1000)
+        batch_info["finish_reason"] = completion.choices[0].finish_reason
 
         if content:
+            # Log raw response
+            print(f"    [Translate] Batch {batch_idx} response ({len(content)} chars): {content[:300]}{'...' if len(content) > 300 else ''}")
+
             result = json.loads(content)
             translations = result.get("translated", [])
             # Pad if needed
             if len(translations) < len(batch):
                 batch_info["status"] = f"partial ({len(translations)}/{len(batch)})"
+                print(f"    [Translate] Batch {batch_idx} WARNING: got {len(translations)} translations for {len(batch)} inputs")
             while len(translations) < len(batch):
                 translations.append("[TRANSLATION FAILED]")
             return batch_idx, translations[:len(batch)], batch_info
         else:
             batch_info["status"] = "empty_response"
-            batch_info["finish_reason"] = completion.choices[0].finish_reason
+            print(f"    [Translate] Batch {batch_idx} empty response, finish_reason: {batch_info['finish_reason']}")
 
     except Exception as e:
         batch_info["time_ms"] = int((time.time() - batch_start) * 1000)
-        batch_info["status"] = f"error: {str(e)[:100]}"
-        print(f"    Translation batch {batch_idx} error: {e}")
+        batch_info["status"] = f"error: {type(e).__name__}"
+        batch_info["error"] = str(e)
+
+        # Print detailed error info
+        print(f"    [Translate] Batch {batch_idx} error: {type(e).__name__}: {e}")
+        if hasattr(e, 'response'):
+            print(f"    [Translate] Response: {e.response}")
+        if hasattr(e, 'status_code'):
+            print(f"    [Translate] Status code: {e.status_code}")
+        if hasattr(e, 'body'):
+            print(f"    [Translate] Body: {e.body}")
+        if hasattr(e, 'message'):
+            print(f"    [Translate] Message: {e.message}")
+        # For connection errors, show more details
+        if hasattr(e, '__cause__') and e.__cause__:
+            print(f"    [Translate] Cause: {type(e.__cause__).__name__}: {e.__cause__}")
 
     return batch_idx, ["[TRANSLATION FAILED]"] * len(batch), batch_info
 

@@ -24,9 +24,11 @@ from .ocr import (
     run_ocr_on_bubbles,
     map_ocr,
     reset_vlm_ocr,
+    reset_api_ocr,
     OCR_URL,
     HAS_LFM_OCR,  # Backwards compat
     HAS_VLM_OCR,
+    HAS_GEMINI_OCR,
 )
 
 # Inpainting
@@ -72,7 +74,8 @@ __all__ = [
     # Detection
     'detect_mode', 'create_session', 'detect_all', 'CROP_PADDING', 'THRESHOLD',
     # OCR
-    'grid_bubbles', 'run_ocr', 'run_ocr_on_bubbles', 'map_ocr', 'reset_vlm_ocr', 'OCR_URL', 'HAS_LFM_OCR', 'HAS_VLM_OCR',
+    'grid_bubbles', 'run_ocr', 'run_ocr_on_bubbles', 'map_ocr', 'reset_vlm_ocr', 'reset_api_ocr',
+    'OCR_URL', 'HAS_LFM_OCR', 'HAS_VLM_OCR', 'HAS_GEMINI_OCR',
     # Inpainting
     'create_inpainter', 'Inpainter',
     # Text Segmentation

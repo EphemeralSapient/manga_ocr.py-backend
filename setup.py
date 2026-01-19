@@ -36,6 +36,7 @@ from config import (
     get_ocr_server_url, get_translate_server_url, get_auto_start_servers,
     get_llama_context_size, get_llama_gpu_layers,
     needs_llama, find_llama, download_mmproj, build_llama_command, LANGUAGES,
+    is_api_ocr_method, get_gemini_api_key,
     ok, warn, err, info, CONFIG_FILE
 )
 
@@ -134,6 +135,29 @@ def install_runtime():
         return False
     ok("ONNX Runtime installed")
     return True
+
+
+def install_api_ocr_deps():
+    """Install API-based OCR dependencies based on config."""
+    cfg = load_config()
+    ocr_method = cfg.get("ocr_method", "qwen_vlm")
+
+    if ocr_method == "gemini_api":
+        console.print("\n[bold cyan]Installing Google AI SDK (for Gemma 3)[/]")
+        if run(['uv', 'pip', 'install', 'google-genai'], "Installing google-genai...", env=venv_env()).returncode == 0:
+            ok("google-genai SDK installed (Gemma 3 API ready)")
+            # Check API key
+            api_key = cfg.get("gemini_api_key", "") or os.environ.get("GEMINI_API_KEY", "")
+            if api_key:
+                ok("Gemini API key configured")
+            else:
+                warn("No Gemini API key set - add to config.json or set GEMINI_API_KEY env var")
+            return True
+        else:
+            err("Failed to install google-genai SDK")
+            return False
+
+    return True  # Nothing to install for non-API OCR methods
 
 def get_cuda_version():
     """Detect CUDA major.minor version from nvidia-smi."""
@@ -370,6 +394,10 @@ def setup_ocr():
             return False
         return setup_windows_ocr()
 
+    elif ocr_method == "gemini_api":
+        # Gemini API - install SDK and verify API key
+        return install_api_ocr_deps()
+
     elif ocr_method in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8"):
         info(f"Model: {cfg.get('ocr_model')}")
         return setup_llama()
@@ -427,12 +455,19 @@ def verify():
     table.add_row("", "")
 
     # OCR
-    ocr_names = {"qwen_vlm": "Qwen VLM", "lfm_vlm": "LFM VL", "ministral_vlm_q8": "Ministral Q8", "oneocr": "OneOCR"}
+    ocr_names = {"qwen_vlm": "Qwen VLM", "lfm_vlm": "LFM VL", "ministral_vlm_q8": "Ministral Q8", "gemini_api": "Gemma 3 API", "oneocr": "OneOCR"}
     table.add_row("OCR", f"[bold]{ocr_names.get(ocr_method, ocr_method)}[/]")
 
     if ocr_method == "oneocr":
         ocr_ok = os.path.exists(os.path.join('workflow', 'ocr', 'oneocr.dll'))
         table.add_row("  Status", "[green]✓ Ready[/]" if ocr_ok else "[red]✗ Not setup[/]")
+    elif ocr_method == "gemini_api":
+        api_key = cfg.get("gemini_api_key", "") or os.environ.get("GEMINI_API_KEY", "")
+        table.add_row("  API Key", "[green]✓ Set[/]" if api_key else "[yellow]⚠ Not set[/]")
+        table.add_row("  Model", cfg.get("gemini_model", "gemini-2.0-flash"))
+        # Check if SDK installed
+        sdk_ok = run([venv_python(), '-c', 'import google.genai'], capture=True, env=env).returncode == 0
+        table.add_row("  SDK", "[green]✓ Installed[/]" if sdk_ok else "[yellow]⚠ Not installed[/]")
     elif ocr_method in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8"):
         table.add_row("  Model", cfg.get("ocr_model", ""))
 
@@ -758,6 +793,16 @@ def show_next_steps():
 
     if llama_running:
         steps += "[bold]llama-server:[/] [green]Running[/] (auto-started)\n\n"
+
+    # Show Gemma 3 API status if configured
+    ocr_method = cfg.get("ocr_method", "qwen_vlm")
+    if ocr_method == "gemini_api":
+        api_key = cfg.get("gemini_api_key", "") or os.environ.get("GEMINI_API_KEY", "")
+        model = cfg.get("gemini_model", "gemma-3-27b-it")
+        if api_key:
+            steps += f"[bold]Gemma 3 API:[/] [green]Configured[/] (model: {model})\n\n"
+        else:
+            steps += "[bold]Gemma 3 API:[/] [yellow]Missing API key[/]\n  Get one at: [cyan]aistudio.google.com/apikey[/]\n\n"
 
     steps += f"[bold]Start server:[/]\n  [cyan]{py} server.py[/]  (port {port})\n\n"
     steps += f"[bold]Test:[/]\n  [cyan]{py} tests/test_client.py[/]\n\n"

@@ -13,20 +13,28 @@ import time
 import requests
 from pathlib import Path
 
-# Load port from config.json
-def _get_server_url():
-    config_path = os.path.join(os.path.dirname(__file__), '..', 'config.json')
-    port = 5000  # default
-    if os.path.exists(config_path):
-        try:
-            with open(config_path) as f:
-                cfg = json.load(f)
-                port = cfg.get('server_port', 5000)
-        except:
-            pass
-    return f"http://localhost:{port}"
+# Add parent directory to path for config import
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-SERVER_URL = _get_server_url()
+# Load config from centralized config module
+try:
+    from config import get_server_port, load_config
+    load_config()
+    SERVER_PORT = get_server_port()
+except ImportError:
+    # Fallback to direct file read
+    def _get_port():
+        config_path = os.path.join(os.path.dirname(__file__), '..', 'config.json')
+        if os.path.exists(config_path):
+            try:
+                with open(config_path) as f:
+                    return json.load(f).get('server_port', 5000)
+            except:
+                pass
+        return 5000
+    SERVER_PORT = _get_port()
+
+SERVER_URL = f"http://localhost:{SERVER_PORT}"
 INPUT_DIR = "input"
 OUTPUT_DIR = "output/translated"
 

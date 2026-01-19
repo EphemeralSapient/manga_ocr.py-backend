@@ -52,7 +52,7 @@ import threading
 
 # Import workflow components
 from workflow import detect_mode, create_session, detect_all, CROP_PADDING
-from workflow import grid_bubbles, run_ocr, run_ocr_on_bubbles, map_ocr, reset_vlm_ocr, HAS_LFM_OCR, HAS_VLM_OCR
+from workflow import grid_bubbles, run_ocr, run_ocr_on_bubbles, map_ocr, reset_vlm_ocr, reset_api_ocr, HAS_LFM_OCR, HAS_VLM_OCR, HAS_GEMINI_OCR
 from workflow import create_inpainter, Inpainter
 from workflow import create_text_segmenter, TextSegmenter
 from workflow import render_text_on_image
@@ -72,6 +72,7 @@ from config import (
     get_ocr_grid_max_cells, get_translation_batch_size,
     find_llama, download_mmproj, build_llama_command,
     get_text_seg_enabled, get_text_seg_model, get_text_seg_input_size,
+    is_api_ocr_method, get_gemini_api_key, get_gemini_model,
 )
 
 # Load configuration
@@ -543,21 +544,42 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
     stats = {"pages": len(images), "output_type": output_type, "ocr_translate": ocr_translate, "translate_local": translate_local, "inpaint_background": inpaint_background}
     session, mode = get_detector()
 
-    # Get text segmenter for L1 text cleaning (pixel-level white fill)
-    # This is separate from L2 inpainting - L1 uses text_seg to fill with white, not AOT
-    text_seg_l1 = get_text_segmenter_instance() if (TEXT_SEG_ENABLED and output_type != "text_only") else None
-
     # Detect bubbles (label1) and text-free regions (label2) if inpainting enabled
     t0 = time.time()
     bubbles, detect_time = detect_all(session, images, mode, target_label=1)
 
     bubbles_l2 = []
     inpaint_future = None
+    text_seg_future = None
     inpainted_images = None
 
     # Track L2 data for later rendering (kept separate from L1)
     l2_data = {}
     l2_ocr_data = {}  # Separate OCR data for L2
+
+    # Parallel executor for background tasks
+    _parallel_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+
+    # Text segmentation function (runs in parallel with OCR)
+    text_seg = get_text_segmenter_instance() if (TEXT_SEG_ENABLED and output_type != "text_only") else None
+
+    def do_text_segmentation():
+        """Run text segmentation on all pages in parallel with OCR."""
+        if text_seg is None:
+            return None, 0
+        t_start = time.time()
+        masks = []
+        for page_idx, img in enumerate(images):
+            img_array = np.array(img)
+            mask = text_seg(img_array, verbose=False)
+            masks.append(mask)
+        elapsed_ms = int((time.time() - t_start) * 1000)
+        print(f"  [TextSeg] {len(masks)} pages in {elapsed_ms}ms")
+        return masks, elapsed_ms
+
+    # Start text segmentation immediately (parallel with everything else)
+    if text_seg is not None:
+        text_seg_future = _parallel_executor.submit(do_text_segmentation)
 
     if inpaint_background and output_type != "text_only":
         # Detect label2 regions for inpainting + OCR/translate
@@ -576,10 +598,9 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
                 'bubble_idx': b['bubble_idx']
             })
 
-        # Start inpainting in background (runs in parallel with OCR/translate)
+        # Start inpainting in parallel with OCR
         if bubbles_l2:
             inpainter = get_inpainter()
-            text_seg = get_text_segmenter_instance() if TEXT_SEG_ENABLED else None
 
             def do_inpainting():
                 t_start = time.time()
@@ -589,17 +610,14 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
                     img_array = np.array(img)
                     page_l2 = l2_data.get(page_idx, [])
                     if page_l2:
-                        img_array, page_stats = inpaint_image(img_array, page_l2, inpainter, text_seg, verbose=False)
+                        img_array, page_stats = inpaint_image(img_array, page_l2, inpainter, None, verbose=False)
                         total_regions += page_stats.get('count', 0)
                     inpainted.append(Image.fromarray(img_array))
                 elapsed_ms = int((time.time() - t_start) * 1000)
-                mode_str = " (text_seg)" if text_seg else ""
-                print(f"  [Inpaint L2] {total_regions} regions in {elapsed_ms}ms{mode_str}")
+                print(f"  [Inpaint L2] {total_regions} regions in {elapsed_ms}ms")
                 return inpainted, elapsed_ms
 
-            # Start inpainting in background thread (non-blocking)
-            _inpaint_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            inpaint_future = _inpaint_executor.submit(do_inpainting)
+            inpaint_future = _parallel_executor.submit(do_inpainting)
     else:
         print(f"  [Detect] {len(bubbles)} bubbles in {detect_time:.0f}ms")
 
@@ -613,37 +631,54 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
         seq_mgr.start_ocr_server()
         stats["sequential_mode"] = True
 
-    # Grid and OCR (optionally with translation)
-    t0 = time.time()
-    if ocr_translate and HAS_VLM_OCR:
-        # Combined OCR + Translation using VLM
-        print(f"  [OCR+Translate] Using VLM for combined OCR and translation...")
-        ocr_result, positions, grid = run_ocr_on_bubbles(bubbles, translate=True)
-        stats["ocr_translate_mode"] = True
-    elif HAS_VLM_OCR:
-        # VLM for OCR only (no translation in this step)
-        print(f"  [OCR] Using VLM for OCR...")
-        ocr_result, positions, grid = run_ocr_on_bubbles(bubbles, translate=False)
-        stats["ocr_translate_mode"] = False
-    else:
-        # Fallback to HTTP OCR
-        grid, positions = grid_bubbles(bubbles)
-        ocr_result = run_ocr(grid)
-        if ocr_translate and not HAS_VLM_OCR:
-            print(f"  [Warning] ocr_translate requested but VLM not available, using standard OCR")
-        stats["ocr_translate_mode"] = False
+    # === Run L1 OCR and L2 OCR in PARALLEL ===
+    _ocr_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
+    def do_ocr_l1():
+        """OCR for L1 (text bubbles)."""
+        t0 = time.time()
+        if ocr_translate and HAS_VLM_OCR:
+            print(f"  [OCR L1] Using VLM for combined OCR and translation...")
+            result, pos, grid = run_ocr_on_bubbles(bubbles, translate=True)
+            mode = "ocr_translate"
+        elif HAS_VLM_OCR:
+            print(f"  [OCR L1] Using VLM for OCR ({len(bubbles)} bubbles)...")
+            result, pos, grid = run_ocr_on_bubbles(bubbles, translate=False)
+            mode = "vlm"
+        else:
+            grid, pos = grid_bubbles(bubbles)
+            result = run_ocr(grid)
+            mode = "http"
+        elapsed = int((time.time() - t0) * 1000)
+        print(f"  [OCR L1] {result.get('line_count', 0)} lines in {elapsed}ms")
+        return result, pos, grid, elapsed, mode
+
+    def do_ocr_l2():
+        """OCR for L2 (text-free regions)."""
+        if not bubbles_l2:
+            return None, None, 0
+        t0 = time.time()
+        if HAS_VLM_OCR:
+            print(f"  [OCR L2] Using VLM for {len(bubbles_l2)} text-free regions...")
+            result, pos, _ = run_ocr_on_bubbles(bubbles_l2, translate=False)
+        else:
+            l2_grid, pos = grid_bubbles(bubbles_l2)
+            result = run_ocr(l2_grid)
+        elapsed = int((time.time() - t0) * 1000)
+        print(f"  [OCR L2] {result.get('line_count', 0)} lines in {elapsed}ms")
+        return result, pos, elapsed
+
+    # Start both OCR tasks in parallel
+    ocr_l1_future = _ocr_executor.submit(do_ocr_l1)
+    ocr_l2_future = _ocr_executor.submit(do_ocr_l2) if (bubbles_l2 and inpaint_background) else None
+
+    # Wait for L1 OCR
+    ocr_result, positions, grid, ocr_time, ocr_mode = ocr_l1_future.result()
+    stats["ocr_translate_mode"] = (ocr_mode == "ocr_translate")
     stats["grid_size"] = f"{grid.width}x{grid.height}" if grid else "batched"
-    ocr_time = int((time.time() - t0) * 1000)
     stats["ocr_ms"] = ocr_time
     stats["ocr_lines"] = ocr_result.get('line_count', 0)
     is_translated = ocr_result.get('translated', False)
-    print(f"  [OCR] {ocr_result.get('line_count', 0)} lines in {ocr_time}ms" + (" (translated)" if is_translated else ""))
-
-    # Sequential model loading: stop OCR server after OCR is done
-    if SEQUENTIAL_MODEL_LOADING and uses_vlm_ocr and HAS_VLM_OCR:
-        seq_mgr = get_sequential_manager()
-        seq_mgr.stop_ocr_server()
 
     # Map OCR to bubbles
     bubble_texts = map_ocr(ocr_result, positions)
@@ -668,37 +703,35 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
     for page_idx in ocr_data:
         ocr_data[page_idx].sort(key=lambda x: x['idx'])
 
-    # === L2 OCR (separate from L1) ===
+    # Wait for L2 OCR (if running)
     l2_ocr_result = None
     l2_positions = None
-    if bubbles_l2 and inpaint_background:
-        t0_l2 = time.time()
-        if HAS_VLM_OCR:
-            print(f"  [OCR L2] Using VLM for {len(bubbles_l2)} text-free regions...")
-            l2_ocr_result, l2_positions, _ = run_ocr_on_bubbles(bubbles_l2, translate=False)
-        else:
-            l2_grid, l2_positions = grid_bubbles(bubbles_l2)
-            l2_ocr_result = run_ocr(l2_grid)
-        l2_ocr_time = int((time.time() - t0_l2) * 1000)
-        print(f"  [OCR L2] {l2_ocr_result.get('line_count', 0)} lines in {l2_ocr_time}ms")
-        stats["ocr_l2_ms"] = l2_ocr_time
-        stats["ocr_l2_lines"] = l2_ocr_result.get('line_count', 0)
+    if ocr_l2_future is not None:
+        l2_ocr_result, l2_positions, l2_ocr_time = ocr_l2_future.result()
+        if l2_ocr_result:
+            stats["ocr_l2_ms"] = l2_ocr_time
+            stats["ocr_l2_lines"] = l2_ocr_result.get('line_count', 0)
 
-        # Map L2 OCR to bubbles
-        l2_bubble_texts = map_ocr(l2_ocr_result, l2_positions)
-        l2_bubble_map = {(b['page_idx'], b['bubble_idx']): b for b in bubbles_l2}
+            # Map L2 OCR to bubbles
+            l2_bubble_texts = map_ocr(l2_ocr_result, l2_positions)
+            l2_bubble_map = {(b['page_idx'], b['bubble_idx']): b for b in bubbles_l2}
 
-        for key, text_items in l2_bubble_texts.items():
-            page_idx, bubble_idx = key
-            b = l2_bubble_map.get(key)
-            if b:
-                if page_idx not in l2_ocr_data:
-                    l2_ocr_data[page_idx] = []
-                l2_ocr_data[page_idx].append({
-                    'idx': bubble_idx,
-                    'bubble_box': list(b['box']),
-                    'texts': text_items
-                })
+            for key, text_items in l2_bubble_texts.items():
+                page_idx, bubble_idx = key
+                b = l2_bubble_map.get(key)
+                if b:
+                    if page_idx not in l2_ocr_data:
+                        l2_ocr_data[page_idx] = []
+                    l2_ocr_data[page_idx].append({
+                        'idx': bubble_idx,
+                        'bubble_box': list(b['box']),
+                        'texts': text_items
+                    })
+
+    # Sequential model loading: stop OCR server after ALL OCR is done (L1 + L2)
+    if SEQUENTIAL_MODEL_LOADING and uses_vlm_ocr and HAS_VLM_OCR:
+        seq_mgr = get_sequential_manager()
+        seq_mgr.stop_ocr_server()
 
     # Extract texts for translation (or use already-translated texts)
     all_texts = []
@@ -831,6 +864,16 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
                 print(f"  [Inpaint L2] Failed: {e}")
                 inpainted_images = None
 
+        # Wait for text segmentation to complete if running
+        text_seg_masks = None
+        if text_seg_future is not None:
+            try:
+                text_seg_masks, text_seg_ms = text_seg_future.result(timeout=120)
+                stats["text_seg_ms"] = text_seg_ms
+            except Exception as e:
+                print(f"  [TextSeg] Failed: {e}")
+                text_seg_masks = None
+
         # Use L2-inpainted images (or original if no L2 inpainting)
         # Note: L1 (text bubbles) are NOT inpainted - translated text is rendered directly
         source_images = inpainted_images if use_inpaint else images
@@ -842,12 +885,16 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
             bubble_images_output[page_idx] = []
             page_translations = translation_data.get(page_idx, {})
             img = source_images[page_idx]
+            page_mask = text_seg_masks[page_idx] if text_seg_masks and page_idx < len(text_seg_masks) else None
 
             for bubble in page_bubbles:
                 # Create a copy of just the bubble area
                 bbox = bubble['bubble_box']
                 x1, y1, x2, y2 = bbox
                 bubble_img = img.crop((x1, y1, x2, y2))
+
+                # Extract mask region for this bubble if available
+                bubble_mask = page_mask[y1:y2, x1:x2] if page_mask is not None else None
 
                 # Render text on the bubble image
                 bubble_copy = bubble_img.copy()
@@ -858,8 +905,8 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
                     'texts': bubble['texts']
                 }
                 temp_translations = {bubble['idx']: page_translations.get(bubble['idx'], "[MISSING]")}
-                # Use text_seg_l1 for pixel-level text cleaning (fills with white)
-                rendered_bubble = render_text_on_image(bubble_copy, [temp_bubble], temp_translations, use_inpaint=use_inpaint, text_segmenter=text_seg_l1)
+                # Use precomputed mask region for text cleaning
+                rendered_bubble = render_text_on_image(bubble_copy, [temp_bubble], temp_translations, use_inpaint=use_inpaint, precomputed_mask=bubble_mask)
 
                 # Convert to base64
                 buf = io.BytesIO()
@@ -895,32 +942,48 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
                 print(f"  [Inpaint L2] Failed: {e}")
                 inpainted_images = None
 
+        # Wait for text segmentation to complete if running
+        text_seg_masks = None
+        if text_seg_future is not None:
+            try:
+                text_seg_masks, text_seg_ms = text_seg_future.result(timeout=120)
+                stats["text_seg_ms"] = text_seg_ms
+                print(f"  [TextSeg] Completed {len(text_seg_masks) if text_seg_masks else 0} pages in {text_seg_ms}ms")
+            except Exception as e:
+                print(f"  [TextSeg] Failed: {e}")
+                text_seg_masks = None
+
         # Use L2-inpainted images (or original if no L2 inpainting)
         # Note: L1 (text bubbles) are NOT inpainted - translated text is rendered directly
         source_images = inpainted_images if use_inpaint else images
 
-        # Render full pages
+        # Render full pages (text_seg already done in parallel, just apply masks)
         t0 = time.time()
         output_images = []
+        render_timing = {}  # Collect detailed timing
         for page_idx, img in enumerate(source_images):
             img_copy = img.copy()
 
-            # Step 1: Render L1 bubbles (with text_seg clearing)
+            # Step 1: Render L1 bubbles (use pre-computed text_seg mask)
             page_bubbles = ocr_data.get(page_idx, [])
             page_translations = translation_data.get(page_idx, {})
-            rendered = render_text_on_image(img_copy, page_bubbles, page_translations, use_inpaint=use_inpaint, text_segmenter=text_seg_l1)
+            page_mask = text_seg_masks[page_idx] if text_seg_masks and page_idx < len(text_seg_masks) else None
+            rendered = render_text_on_image(img_copy, page_bubbles, page_translations, use_inpaint=use_inpaint, precomputed_mask=page_mask, timing=render_timing)
 
             # Step 2: Render L2 translations (no clearing - already inpainted)
             page_l2_bubbles = l2_ocr_data.get(page_idx, [])
             page_l2_translations = l2_translation_data.get(page_idx, {})
             if page_l2_bubbles and page_l2_translations:
-                rendered = render_text_on_image(rendered, page_l2_bubbles, page_l2_translations, use_inpaint=True, text_segmenter=None)
+                rendered = render_text_on_image(rendered, page_l2_bubbles, page_l2_translations, use_inpaint=True, precomputed_mask=None, timing=render_timing)
 
             output_images.append(rendered)
 
         render_time = int((time.time() - t0) * 1000)
         stats["render_ms"] = render_time
-        print(f"  [Full Page] Rendered {len(output_images)} pages in {render_time}ms" + (" (inpainted)" if use_inpaint else ""))
+        stats["render_detail"] = render_timing
+        # Print detailed render timing
+        detail_str = f"text_seg={render_timing.get('text_seg_ms', 0)}ms, mask={render_timing.get('mask_apply_ms', 0)}ms, text={render_timing.get('text_render_ms', 0)}ms"
+        print(f"  [Full Page] Rendered {len(output_images)} pages in {render_time}ms ({detail_str})" + (" (inpainted)" if use_inpaint else ""))
         return ocr_data, output_images, stats
 
 
@@ -1404,15 +1467,22 @@ def reset_vlm():
     """
     try:
         reset_vlm_ocr()
+        reset_api_ocr()
         # Reload config to get new model info
-        from config import load_config, get_ocr_method, get_ocr_model
+        from config import load_config, get_ocr_method, get_ocr_model, is_api_ocr_method
         cfg = load_config()
-        return jsonify({
+        ocr_method = get_ocr_method()
+        response = {
             'status': 'ok',
-            'message': 'VLM OCR instance reset. Next OCR request will use new model.',
-            'ocr_method': get_ocr_method(),
-            'ocr_model': get_ocr_model()
-        })
+            'message': 'OCR instances reset. Next OCR request will use new model.',
+            'ocr_method': ocr_method,
+        }
+        if is_api_ocr_method(ocr_method):
+            response['ocr_type'] = 'api'
+        else:
+            response['ocr_model'] = get_ocr_model()
+            response['ocr_type'] = 'local'
+        return jsonify(response)
     except Exception as e:
         return jsonify({'status': 'error', 'error': str(e)}), 500
 
@@ -1839,7 +1909,11 @@ if __name__ == '__main__':
     print(f"  Target language: {get_target_language()}")
     print(f"  Default mode: {DEFAULT_TRANSLATE_MODE}")
     if TRANSLATE_METHOD == 'cerebras_api':
-        print(f"  API key: {'configured' if CEREBRAS_API_KEY else 'NOT SET'}")
+        print(f"  Cerebras API key: {'configured' if CEREBRAS_API_KEY else 'NOT SET'}")
+    if OCR_METHOD == 'gemini_api':
+        gemini_key = get_gemini_api_key() or os.environ.get("GEMINI_API_KEY", "")
+        print(f"  Gemma/Gemini API key: {'configured' if gemini_key else 'NOT SET'}")
+        print(f"  Gemma model: {get_gemini_model()}")
     print(f"  Auto-start: {AUTO_START_SERVERS}")
     if SEQUENTIAL_MODEL_LOADING:
         print(f"  Sequential loading: ENABLED (low VRAM mode - one model at a time)")
@@ -1873,21 +1947,35 @@ if __name__ == '__main__':
     print(f"  {'*' if DEFAULT_TRANSLATE_MODE == 'api' else ' '} (default)            - VLM OCR + Cerebras API")
     print("")
 
-    # Show VLM OCR availability
-    llama_server_path = find_llama()
-    if HAS_VLM_OCR or llama_server_path:
-        print(f"VLM OCR: Available ({llama_server_path})")
+    # Show OCR backend availability
+    if is_api_ocr_method(OCR_METHOD):
+        # API-based OCR (Gemma 3, etc)
+        if OCR_METHOD == "gemini_api":
+            gemini_key = get_gemini_api_key() or os.environ.get("GEMINI_API_KEY", "")
+            if HAS_GEMINI_OCR and gemini_key:
+                print(f"Gemma 3 API OCR: Available (model: {get_gemini_model()})")
+            elif not HAS_GEMINI_OCR:
+                print("Gemma 3 API OCR: SDK not installed")
+                print("  Run: pip install google-genai")
+            else:
+                print("Gemma 3 API OCR: API key not set")
+                print("  Set GEMINI_API_KEY env var or add gemini_api_key to config.json")
     else:
-        print("VLM OCR: Not available")
-        llama_cli_path = get_llama_cli_path()
-        if llama_cli_path:
-            print(f"  llama_cli_path set to: {llama_cli_path}")
-            if os.path.isdir(llama_cli_path):
-                print(f"  -> Directory exists, but llama-server not found inside")
-            elif not os.path.exists(llama_cli_path):
-                print(f"  -> Path does not exist")
+        # VLM OCR (local)
+        llama_server_path = find_llama()
+        if HAS_VLM_OCR or llama_server_path:
+            print(f"VLM OCR: Available ({llama_server_path})")
         else:
-            print("  Set llama_cli_path in config.json or install llama.cpp")
+            print("VLM OCR: Not available")
+            llama_cli_path = get_llama_cli_path()
+            if llama_cli_path:
+                print(f"  llama_cli_path set to: {llama_cli_path}")
+                if os.path.isdir(llama_cli_path):
+                    print(f"  -> Directory exists, but llama-server not found inside")
+                elif not os.path.exists(llama_cli_path):
+                    print(f"  -> Path does not exist")
+            else:
+                print("  Set llama_cli_path in config.json or install llama.cpp")
     print("=" * 40)
 
     # Auto-start llama servers if configured and needed
