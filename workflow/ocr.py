@@ -670,8 +670,8 @@ def map_ocr(ocr_result, positions, is_translated=None, verbose=False):
         cy = (ocr_y1 + ocr_y2) / 2
 
         # Matching with small tolerance (DPI normalization isn't always perfect)
-        # With 30px padding, 10px tolerance is safe and won't cross-match
-        TOLERANCE = 10
+        # With 30px padding, 15px tolerance is safe and won't cross-match
+        TOLERANCE = 15
         matched = False
         matched_pos = None
 
