@@ -92,6 +92,8 @@ DEFAULT_CONFIG = {
 
     # Gemma/Gemini API settings (for gemini_api OCR and gemini_translate methods)
     # Uses Google AI Studio API - get key at https://aistudio.google.com/apikey
+    # TIP: For higher rate limits, create multiple Projects in AI Studio (each has 30 req/min)
+    #      and paste comma-separated keys: "key1,key2,key3" to multiply rate limits
     "gemini_api_key": "",
     "gemini_model": "gemma-3-27b-it",           # OCR model options:
                                                  # - gemma-3-27b-it (14.4k req/day - RECOMMENDED)
@@ -866,9 +868,16 @@ def run_wizard() -> dict:
 
         # Gemini API key if using gemini_api OCR
         if cfg["ocr_method"] == "gemini_api":
-            console.print("[dim]Input is hidden for security - just type and press Enter[/]")
+            console.print("\n[bold cyan]Gemini API Key Setup:[/bold cyan]")
+            console.print("Get your key at: [cyan]aistudio.google.com/apikey[/cyan]")
+            console.print("\n[yellow]Tips for higher rate limits:[/yellow]")
+            console.print("  1. Create a [bold]Project[/bold] in AI Studio (not just an API key)")
+            console.print("  2. Each project has its own rate limit ([green]30 req/min[/green] for gemma-3-27b-it)")
+            console.print("  3. You can create up to [bold]8-10 projects[/bold]")
+            console.print("  4. Paste multiple keys [yellow]comma-separated[/yellow] (key1,key2,key3)")
+            console.print("     to multiply your rate limits\n")
             cfg["gemini_api_key"] = prompt_input(
-                "Gemini API Key (from aistudio.google.com/apikey)",
+                "Gemini API Key(s) - comma-separated for multiple",
                 cfg.get("gemini_api_key", ""),
                 secret=True
             )
@@ -926,9 +935,12 @@ def run_wizard() -> dict:
             cfg["gemini_translate_model"] = translate_choice.split(":", 1)[1]
             # Ensure we have API key for Gemini translation
             if not cfg.get("gemini_api_key"):
-                console.print("[dim]Input is hidden for security - just type and press Enter[/]")
+                console.print("\n[bold cyan]Gemini API Key Setup:[/bold cyan]")
+                console.print("Get your key at: [cyan]aistudio.google.com/apikey[/cyan]")
+                console.print("[yellow]Tip:[/yellow] Create keys in different [bold]Projects[/bold] and paste")
+                console.print("     them [yellow]comma-separated[/yellow] (key1,key2) to multiply rate limits.\n")
                 cfg["gemini_api_key"] = prompt_input(
-                    "Gemini API Key (from aistudio.google.com/apikey)",
+                    "Gemini API Key(s) - comma-separated for multiple",
                     cfg.get("gemini_api_key", ""),
                     secret=True
                 )

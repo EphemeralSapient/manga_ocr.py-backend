@@ -73,7 +73,7 @@ from config import (
     get_ocr_grid_max_cells, get_translation_batch_size,
     find_llama, download_mmproj, build_llama_command,
     get_text_seg_enabled, get_text_seg_model, get_text_seg_input_size,
-    is_api_ocr_method, get_gemini_api_key, get_gemini_model,
+    is_api_ocr_method, get_gemini_api_key, get_gemini_model, get_gemini_translate_model,
 )
 
 # Load configuration
@@ -898,21 +898,21 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
     print(f"  [DEBUG Translation Mapping]")
     print(f"    text_mapping ({len(text_mapping)} entries):")
     for i, (page_idx, bubble_idx, is_l2) in enumerate(text_mapping):
-        src = all_texts[i][:20].replace('\n', '\\n') if i < len(all_texts) else '?'
-        trans = translations[i][:20].replace('\n', '\\n') if i < len(translations) else '?'
+        src = all_texts[i][:40].replace('\n', ' ') if i < len(all_texts) else '?'
+        trans = translations[i][:50].replace('\n', ' ') if i < len(translations) else '?'
         label = "L2" if is_l2 else "L1"
         print(f"      [{i}] page={page_idx}, bubble={bubble_idx} ({label}): '{src}' → '{trans}'")
 
     print(f"    L1 translation_data:")
     for page_idx in sorted(translation_data.keys()):
         for bubble_idx, trans in sorted(translation_data[page_idx].items()):
-            print(f"      Page {page_idx}, Bubble {bubble_idx}: '{trans[:30]}'")
+            print(f"      Page {page_idx}, Bubble {bubble_idx}: '{trans[:60]}'")
 
     if l2_translation_data:
         print(f"    L2 translation_data:")
         for page_idx in sorted(l2_translation_data.keys()):
             for bubble_idx, trans in sorted(l2_translation_data[page_idx].items()):
-                print(f"      Page {page_idx}, Bubble {bubble_idx}: '{trans[:30]}'")
+                print(f"      Page {page_idx}, Bubble {bubble_idx}: '{trans[:60]}'")
 
     # Handle different output types
     if output_type == "text_only":
@@ -1987,86 +1987,109 @@ def translate_label1_stream():
 
 
 if __name__ == '__main__':
-    print("Manga Translation Server")
-    print("=" * 40)
+    # Rich UI imports
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        from rich.panel import Panel
+        from rich import box
+        console = Console()
+        HAS_RICH = True
+    except ImportError:
+        HAS_RICH = False
+        console = None
 
-    # Show config
-    print("Configuration:")
-    config_file_exists = os.path.exists(CONFIG_FILE)
-    print(f"  Config file: {CONFIG_FILE} ({'loaded' if config_file_exists else 'using defaults'})")
-    print(f"  OCR method: {OCR_METHOD}")
-    print(f"  Translate method: {TRANSLATE_METHOD}")
-    print(f"  Target language: {get_target_language()}")
-    print(f"  Default mode: {DEFAULT_TRANSLATE_MODE}")
-    if TRANSLATE_METHOD == 'cerebras_api':
-        print(f"  Cerebras API key: {'configured' if CEREBRAS_API_KEY else 'NOT SET'}")
-    if OCR_METHOD == 'gemini_api':
-        gemini_key = get_gemini_api_key() or os.environ.get("GEMINI_API_KEY", "")
-        print(f"  Gemma/Gemini API key: {'configured' if gemini_key else 'NOT SET'}")
-        print(f"  Gemma model: {get_gemini_model()}")
-    print(f"  Auto-start: {AUTO_START_SERVERS}")
-    if SEQUENTIAL_MODEL_LOADING:
-        print(f"  Sequential loading: ENABLED (low VRAM mode - one model at a time)")
-    if STREAMING_ENABLED:
-        print(f"  Streaming: ENABLED (SSE endpoint available)")
-
-    # Show llama.cpp config if needed
-    if needs_llama():
-        llama_path = get_llama_cli_path()
-        print(f"  llama_cli_path: {llama_path or '(not set)'}")
-        print(f"  OCR model: {get_ocr_model()}")
-        if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt"):
-            print(f"  Translate model: {get_translate_model()}")
-    print("")
-
-    print("Endpoints:")
-    print("  POST /translate/label1  - Text bubbles + AOT inpainting (default)")
-    print("  POST /translate/label2  - Legacy mode (sequential inpainting)")
-    if STREAMING_ENABLED:
-        print("  POST /translate/label1/stream - SSE streaming (parallel OCR→translate)")
-    print("  GET  /health           - Health check")
-    print("")
-    print("AOT Inpainting (default enabled):")
-    print("  Label1 now detects both label1 (text) and label2 (text-free) regions")
-    print("  Inpainting runs in PARALLEL with OCR/translate for faster processing")
-    print("  Use inpaint_background=false to disable (white background only)")
-    print("")
-    print("Translation modes:")
-    print(f"  {'*' if DEFAULT_TRANSLATE_MODE == 'vlm' else ' '} ocr_translate=true   - VLM does OCR+translate")
-    print(f"  {'*' if DEFAULT_TRANSLATE_MODE == 'local' else ' '} translate_local=true - VLM OCR + local LLM translate")
-    print(f"  {'*' if DEFAULT_TRANSLATE_MODE == 'api' else ' '} (default)            - VLM OCR + Cerebras API")
-    print("")
-
-    # Show OCR backend availability
-    if is_api_ocr_method(OCR_METHOD):
-        # API-based OCR (Gemma 3, etc)
+    def _get_ocr_display():
+        """Get OCR method display string."""
         if OCR_METHOD == "gemini_api":
+            model = get_gemini_model()
+            return f"Gemini API ({model})"
+        elif OCR_METHOD == "oneocr_remote":
+            return "OneOCR Remote"
+        return OCR_METHOD
+
+    def _get_translate_display():
+        """Get translate method display string."""
+        if TRANSLATE_METHOD == "cerebras_api":
+            return "Cerebras API"
+        elif TRANSLATE_METHOD == "gemini_translate":
+            model = get_gemini_translate_model()
+            return f"Gemini API ({model})"
+        return TRANSLATE_METHOD
+
+    def _get_gemini_keys_info():
+        """Get Gemini API keys info."""
+        from config import get_gemini_api_keys
+        keys = get_gemini_api_keys()
+        if not keys:
+            return "[red]NOT SET[/red]", 0
+        return f"[green]{len(keys)} key(s)[/green]", len(keys)
+
+    if HAS_RICH:
+        # Rich UI banner
+        console.print(Panel.fit(
+            "[bold cyan]Manga Translation Server[/bold cyan]",
+            border_style="cyan"
+        ))
+
+        # Configuration table
+        config_table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
+        config_table.add_column("Setting", style="dim")
+        config_table.add_column("Value")
+
+        config_file_exists = os.path.exists(CONFIG_FILE)
+        config_table.add_row("Config", f"{CONFIG_FILE} [dim]({'loaded' if config_file_exists else 'defaults'})[/dim]")
+        config_table.add_row("OCR", f"[cyan]{_get_ocr_display()}[/cyan]")
+        config_table.add_row("Translate", f"[cyan]{_get_translate_display()}[/cyan]")
+        config_table.add_row("Target", f"[green]{get_target_language()}[/green]")
+
+        # API keys status
+        if OCR_METHOD == "gemini_api" or TRANSLATE_METHOD == "gemini_translate":
+            gemini_status, key_count = _get_gemini_keys_info()
+            rate_info = f" [dim]({key_count * 30} req/min)[/dim]" if key_count > 0 else ""
+            config_table.add_row("Gemini Keys", f"{gemini_status}{rate_info}")
+
+        if TRANSLATE_METHOD == "cerebras_api":
+            cerebras_status = "[green]configured[/green]" if CEREBRAS_API_KEY else "[red]NOT SET[/red]"
+            config_table.add_row("Cerebras Key", cerebras_status)
+
+        console.print(config_table)
+
+        # Endpoints
+        console.print("\n[bold]Endpoints:[/bold]")
+        console.print("  [cyan]POST[/cyan] /translate/label1  [dim]- Text bubbles + AOT inpainting[/dim]")
+        console.print("  [cyan]POST[/cyan] /translate/label2  [dim]- Text-free regions[/dim]")
+        console.print("  [cyan]GET[/cyan]  /health            [dim]- Health check[/dim]")
+
+        # Status
+        console.print("")
+        if is_api_ocr_method(OCR_METHOD) and OCR_METHOD == "gemini_api":
             gemini_key = get_gemini_api_key() or os.environ.get("GEMINI_API_KEY", "")
             if HAS_GEMINI_OCR and gemini_key:
-                print(f"Gemma 3 API OCR: Available (model: {get_gemini_model()})")
+                console.print(f"[green]✓[/green] Gemini OCR ready ({get_gemini_model()})")
             elif not HAS_GEMINI_OCR:
-                print("Gemma 3 API OCR: SDK not installed")
-                print("  Run: pip install google-genai")
+                console.print("[red]✗[/red] Gemini SDK not installed [dim](pip install google-genai)[/dim]")
             else:
-                print("Gemma 3 API OCR: API key not set")
-                print("  Set GEMINI_API_KEY env var or add gemini_api_key to config.json")
+                console.print("[red]✗[/red] Gemini API key not set")
+
+        if TRANSLATE_METHOD == "gemini_translate":
+            if HAS_GEMINI_TRANSLATE:
+                console.print(f"[green]✓[/green] Gemini Translate ready ({get_gemini_translate_model()})")
+        elif TRANSLATE_METHOD == "cerebras_api":
+            if CEREBRAS_API_KEY:
+                console.print("[green]✓[/green] Cerebras Translate ready")
+            else:
+                console.print("[red]✗[/red] Cerebras API key not set")
+
+        console.print("")
     else:
-        # VLM OCR (local)
-        llama_server_path = find_llama()
-        if HAS_VLM_OCR or llama_server_path:
-            print(f"VLM OCR: Available ({llama_server_path})")
-        else:
-            print("VLM OCR: Not available")
-            llama_cli_path = get_llama_cli_path()
-            if llama_cli_path:
-                print(f"  llama_cli_path set to: {llama_cli_path}")
-                if os.path.isdir(llama_cli_path):
-                    print(f"  -> Directory exists, but llama-server not found inside")
-                elif not os.path.exists(llama_cli_path):
-                    print(f"  -> Path does not exist")
-            else:
-                print("  Set llama_cli_path in config.json or install llama.cpp")
-    print("=" * 40)
+        # Fallback plain text
+        print("Manga Translation Server")
+        print("=" * 40)
+        print(f"OCR: {_get_ocr_display()}")
+        print(f"Translate: {_get_translate_display()}")
+        print(f"Target: {get_target_language()}")
+        print("=" * 40)
 
     # Auto-start llama servers if configured and needed
     if needs_llama() and AUTO_START_SERVERS and not SEQUENTIAL_MODEL_LOADING:

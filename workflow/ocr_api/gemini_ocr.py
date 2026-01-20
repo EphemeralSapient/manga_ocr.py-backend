@@ -127,20 +127,82 @@ def _build_ocr_prompt(grid_info: Dict, translate: bool = False) -> str:
 
     if n == 1:
         if translate:
-            return f"OCR: Read the text in this image (Japanese/Korean/Chinese) and translate to {target_lang}. Output ONLY the translation, no preamble."
-        return "OCR: Read the text in this image exactly as written. Output ONLY the text, no preamble or explanation."
+            return f"""OCR and translate the manga speech bubble text in this image.
+
+RULES:
+- Preserve character names exactly (e.g., 佳奈, カナ, Kana)
+- Keep punctuation accurate: 。！？…〜 etc.
+- Distinguish between names and regular words
+- Read vertical Japanese text top-to-bottom, right-to-left
+
+Output JSON only:
+{{"text": "translated text here"}}
+
+Translate to {target_lang}. No preamble."""
+        return """OCR the manga speech bubble text in this image.
+
+RULES:
+- Preserve character names exactly (e.g., 佳奈, カナ, Kana)
+- Keep ALL punctuation accurate: 。！？…〜っ etc.
+- Read vertical Japanese text top-to-bottom, right-to-left
+- Preserve small kana (っ, ゃ, ゅ, ょ) and furigana readings
+- Distinguish names from regular words (names often appear standalone or with particles)
+
+Output JSON only:
+{"text": "exact text here"}
+
+No preamble or explanation."""
     else:
         if translate:
-            return f"""OCR: {n} manga speech bubbles in a grid (BLUE=column separator, RED=row separator).
-Output exactly {n} entries: [0]: translation [1]: translation ... [{n-1}]: translation
-Translate Japanese/Korean/Chinese to {target_lang}. Output ONLY the numbered entries, nothing else."""
-        return f"""OCR: {n} manga speech bubbles in a grid (BLUE=column separator, RED=row separator).
-Output exactly {n} entries: [0]: text [1]: text ... [{n-1}]: text
-Read each bubble's text exactly as written. Output ONLY the numbered entries, nothing else."""
+            return f"""OCR and translate {n} manga speech bubbles in a grid image.
+Grid layout: BLUE lines = column separators, RED lines = row separators.
+Read cells left-to-right, top-to-bottom (cell 0 is top-left).
+
+RULES:
+- Preserve character names exactly when translating (e.g., 佳奈 → Kana)
+- Keep emotional punctuation: ！→!, ？→?, …→..., 〜→~
+- Each bubble is separate dialogue - maintain speaker distinction
+- Read vertical Japanese text top-to-bottom, right-to-left within each cell
+
+Output JSON only (exactly {n} entries):
+{{
+  "bubbles": [
+    {{"id": 0, "text": "translation"}},
+    {{"id": 1, "text": "translation"}},
+    ...
+    {{"id": {n-1}, "text": "translation"}}
+  ]
+}}
+
+Translate to {target_lang}. No preamble."""
+        return f"""OCR {n} manga speech bubbles in a grid image.
+Grid layout: BLUE lines = column separators, RED lines = row separators.
+Read cells left-to-right, top-to-bottom (cell 0 is top-left).
+
+RULES:
+- Preserve character names exactly (e.g., 佳奈, カナ, Kana)
+- Keep ALL punctuation: 。！？…〜っ、 etc.
+- Preserve small kana (っ, ゃ, ゅ, ょ) and furigana readings
+- Read vertical Japanese text top-to-bottom, right-to-left within each cell
+- Distinguish names from regular words (names often standalone or with particles like は, が, の)
+- If text is a name only (like 佳奈), output just the name
+
+Output JSON only (exactly {n} entries):
+{{
+  "bubbles": [
+    {{"id": 0, "text": "exact text"}},
+    {{"id": 1, "text": "exact text"}},
+    ...
+    {{"id": {n-1}, "text": "exact text"}}
+  ]
+}}
+
+No preamble or explanation."""
 
 
 def _parse_gemini_output(output: str, num_expected: int) -> Dict[int, str]:
-    """Parse Gemini output to extract cell texts."""
+    """Parse Gemini output to extract cell texts. Supports JSON and legacy [N]: format."""
+    import json
     cell_texts = {}
 
     # Strip common preambles that Gemini adds
@@ -149,20 +211,56 @@ def _parse_gemini_output(output: str, num_expected: int) -> Dict[int, str]:
         r"^Here'?s the OCR (?:result|output)[^:]*:\s*",
         r"^OCR (?:result|output)[^:]*:\s*",
         r"^Following your (?:instructions|format)[^:]*:\s*",
+        r"^```json\s*",
+        r"\s*```$",
     ]
     for pattern in preamble_patterns:
         output = re.sub(pattern, '', output, flags=re.IGNORECASE)
     output = output.strip()
 
+    # Try JSON parsing first (new format)
+    try:
+        data = json.loads(output)
+
+        # Single cell format: {"text": "..."}
+        if num_expected == 1 and 'text' in data:
+            text = data['text'].strip()
+            if text:
+                cell_texts[0] = text
+            return cell_texts
+
+        # Multi-cell format: {"bubbles": [{"id": 0, "text": "..."}, ...]}
+        if 'bubbles' in data and isinstance(data['bubbles'], list):
+            for bubble in data['bubbles']:
+                if isinstance(bubble, dict) and 'id' in bubble and 'text' in bubble:
+                    idx = int(bubble['id'])
+                    text = bubble['text'].strip()
+                    if text and idx < num_expected:
+                        cell_texts[idx] = text
+            if cell_texts:
+                return cell_texts
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        pass  # Fall back to legacy parsing
+
+    # Legacy format: single cell
     if num_expected == 1:
         text = output
         if text.startswith('[0]:'):
             text = text[4:].strip()
+        # Try extracting from partial JSON
+        if text.startswith('{"text":'):
+            try:
+                # Handle incomplete JSON
+                match = re.search(r'"text"\s*:\s*"([^"]*)"', text)
+                if match:
+                    text = match.group(1)
+            except Exception:
+                pass
         if text:
             cell_texts[0] = text
         return cell_texts
 
-    # Multi-cell: parse [N]: format - handles both newline and space separated
+    # Legacy multi-cell: parse [N]: format - handles both newline and space separated
     # Pattern matches [N]: followed by text until next [N]: or end
     # Use non-greedy match and lookahead for next bracket
     pattern = r'\[(\d+)\]:\s*(.+?)(?=\s*\[\d+\]:|$)'
@@ -173,6 +271,18 @@ def _parse_gemini_output(output: str, num_expected: int) -> Dict[int, str]:
                 cell_texts[idx] = text
         except (ValueError, IndexError):
             continue
+
+    # Also try to extract from malformed JSON with bubbles array
+    if not cell_texts:
+        # Try to find bubble entries even in malformed JSON
+        bubble_pattern = r'"id"\s*:\s*(\d+)\s*,\s*"text"\s*:\s*"([^"]*)"'
+        for match in re.findall(bubble_pattern, output):
+            try:
+                idx, text = int(match[0]), match[1].strip()
+                if text and idx < num_expected:
+                    cell_texts[idx] = text
+            except (ValueError, IndexError):
+                continue
 
     return cell_texts
 
