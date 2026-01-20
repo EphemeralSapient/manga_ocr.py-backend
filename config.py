@@ -297,8 +297,44 @@ def get_translate_model() -> str:
 def get_cerebras_api_key() -> str:
     return get("cerebras_api_key", "")
 
+# Gemini API key rotation for rate limit management
+_gemini_key_index = 0
+_gemini_key_lock = None
+
+def get_gemini_api_keys() -> list:
+    """Get list of Gemini API keys (supports comma-separated keys)."""
+    key_str = get("gemini_api_key", "")
+    if not key_str:
+        return []
+    # Split by comma and strip whitespace
+    keys = [k.strip() for k in key_str.split(",") if k.strip()]
+    return keys
+
 def get_gemini_api_key() -> str:
-    return get("gemini_api_key", "")
+    """Get a single Gemini API key (first one if multiple)."""
+    keys = get_gemini_api_keys()
+    return keys[0] if keys else ""
+
+def get_next_gemini_api_key() -> str:
+    """Get next Gemini API key in round-robin rotation (thread-safe)."""
+    global _gemini_key_index, _gemini_key_lock
+    import threading
+    if _gemini_key_lock is None:
+        _gemini_key_lock = threading.Lock()
+
+    keys = get_gemini_api_keys()
+    if not keys:
+        return ""
+    if len(keys) == 1:
+        return keys[0]
+
+    with _gemini_key_lock:
+        key_idx = _gemini_key_index % len(keys)
+        key = keys[key_idx]
+        _gemini_key_index += 1
+        # Log key rotation (show last 4 chars for identification)
+        print(f"    [API Key] Using key {key_idx + 1}/{len(keys)} (...{key[-4:]})")
+        return key
 
 def get_gemini_model() -> str:
     return get("gemini_model", "gemma-3-27b-it")

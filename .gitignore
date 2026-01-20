@@ -5,6 +5,7 @@ __py*
 *.pt
 *.json
 *.patch
+*.DS*
 .venv
 input/*
 output/*

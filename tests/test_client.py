@@ -270,7 +270,7 @@ def main():
     elif translate_local:
         print(f"Using VLM OCR + Local LLM Translation")
     else:
-        print(f"Using VLM OCR + Cerebras API Translation")
+        print(f"Using VLM OCR + API Translation (see server config)")
     if inpaint_background:
         print(f"AOT Inpainting: Enabled (parallel with OCR/translate)")
     else:

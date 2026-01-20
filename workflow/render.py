@@ -158,15 +158,22 @@ def render_text_on_image(
         # Clean text in bubbles - use text_seg for pixel-level or bbox fallback
         # Note: L2 bubbles are rendered in a separate call with text_segmenter=None (skip clearing)
         bx1, by1, bx2, by2 = bubble_box
+        img_h, img_w = img_array.shape[:2]
 
         if full_page_mask is not None:
             # Extract mask region for this bubble from full-page mask
+            # When using grid-based text_seg, the mask is already properly aligned
             mask_region = full_page_mask[by1:by2, bx1:bx2]
 
-            # Fill text pixels with white using the pre-computed mask
-            # Use low threshold (30) to catch full characters including anti-aliased edges
-            if np.any(mask_region > 30):
-                img_array[by1:by2, bx1:bx2][mask_region > 30] = 255
+            # Moderate threshold with limited dilation to avoid affecting bubble edges
+            if np.any(mask_region > 5):
+                from scipy import ndimage
+                # Text pixels with moderate confidence
+                text_mask = mask_region > 5
+                # Light dilation to catch immediate anti-aliasing only
+                final_mask = ndimage.binary_dilation(text_mask, iterations=2)
+                # Apply mask
+                img_array[by1:by2, bx1:bx2][final_mask] = 255
 
         elif text_segmenter is not None:
             # Fallback: bbox-based white fill (only if text_segmenter was provided but mask failed)

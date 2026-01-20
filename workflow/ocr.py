@@ -488,7 +488,8 @@ def map_ocr(ocr_result, positions, is_translated=None):
 
         # Skip Japanese character filter if output is already translated to English
         if not is_translated:
-            if not any('\u3040' <= c <= '\u30ff' or '\u4e00' <= c <= '\u9fff' for c in text):
+            # Include: hiragana, katakana, CJK, and half-width katakana (U+FF65-U+FF9F)
+            if not any('\u3040' <= c <= '\u30ff' or '\u4e00' <= c <= '\u9fff' or '\uff65' <= c <= '\uff9f' for c in text):
                 continue
 
         # Try direct cell_idx mapping (VLM OCR output)

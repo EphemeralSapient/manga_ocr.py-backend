@@ -22,41 +22,58 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import (
     get_gemini_api_key,
+    get_next_gemini_api_key,
     get_gemini_translate_model,
     get_target_language_name,
 )
 
 # Lazy import google-genai
-_genai_client = None
+_genai_module = None
 _genai_types = None
 
 
-def _get_genai():
-    """Lazy load google-genai module."""
-    global _genai_client, _genai_types
-    if _genai_client is not None:
-        return _genai_client, _genai_types
+def _get_genai_module():
+    """Lazy load google-genai module (without creating client)."""
+    global _genai_module, _genai_types
+    if _genai_module is not None:
+        return _genai_module, _genai_types
 
     try:
         from google import genai
         from google.genai import types
-
-        # Get API key from environment or config
-        api_key = os.environ.get('GEMINI_API_KEY', '')
-        if not api_key:
-            api_key = get_gemini_api_key()
-
-        if not api_key:
-            return None, None
-
-        _genai_client = genai.Client(api_key=api_key)
+        _genai_module = genai
         _genai_types = types
-        return _genai_client, _genai_types
+        return _genai_module, _genai_types
     except ImportError:
         return None, None
-    except Exception as e:
-        print(f"[Gemini Translate] Failed to initialize: {e}")
+
+
+def _get_client_with_key(api_key: str = None):
+    """Create a Gemini client with the specified (or rotated) API key."""
+    genai, types = _get_genai_module()
+    if genai is None:
         return None, None
+
+    # Get API key - use rotated key if not specified
+    if not api_key:
+        api_key = os.environ.get('GEMINI_API_KEY', '')
+    if not api_key:
+        api_key = get_next_gemini_api_key()
+
+    if not api_key:
+        return None, None
+
+    try:
+        client = genai.Client(api_key=api_key)
+        return client, types
+    except Exception as e:
+        print(f"[Gemini Translate] Failed to create client: {e}")
+        return None, None
+
+
+def _get_genai():
+    """Legacy function - creates client with first available key."""
+    return _get_client_with_key()
 
 
 def check_gemini_available() -> bool:
@@ -202,9 +219,10 @@ def translate_texts_gemini(
     if not texts:
         return []
 
-    client, _ = _get_genai()
-    if client is None:
-        print("[Gemini Translate] Error: Gemini API not available (check API key)")
+    # Check if API is available (don't create client yet - each batch gets rotated key)
+    genai_module, _ = _get_genai_module()
+    if genai_module is None:
+        print("[Gemini Translate] Error: Gemini API not available (SDK not installed)")
         return ["[TRANSLATION FAILED]"] * len(texts)
 
     t0 = time.time()
@@ -219,11 +237,19 @@ def translate_texts_gemini(
     all_translations = []
     batch_stats = []
 
-    # Run batches in parallel
+    def translate_batch_with_rotated_key(batch_idx, batch):
+        """Wrapper that creates a client with rotated key for each batch."""
+        client, _ = _get_client_with_key()  # Gets next key in rotation
+        if client is None:
+            print(f"[Gemini Translate] Error: No API key available for batch {batch_idx}")
+            return batch_idx, ["[TRANSLATION FAILED]"] * len(batch), {"error": "no_api_key"}
+        return translate_batch_gemini(client, batch_idx, batch, model, target_lang)
+
+    # Run batches in parallel (each batch gets rotated API key)
     batch_results = [None] * len(batches)
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(batches), MAX_WORKERS)) as executor:
         futures = {
-            executor.submit(translate_batch_gemini, client, i, batch, model, target_lang): i
+            executor.submit(translate_batch_with_rotated_key, i, batch): i
             for i, batch in enumerate(batches)
         }
         for future in concurrent.futures.as_completed(futures):

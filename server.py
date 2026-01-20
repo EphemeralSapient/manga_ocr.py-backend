@@ -563,26 +563,9 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
     # Parallel executor for background tasks
     _parallel_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 
-    # Text segmentation function (runs in parallel with OCR)
+    # Text segmentation instance (will run on grid after OCR creates it)
     text_seg = get_text_segmenter_instance() if (TEXT_SEG_ENABLED and output_type != "text_only") else None
-
-    def do_text_segmentation():
-        """Run text segmentation on all pages in parallel with OCR."""
-        if text_seg is None:
-            return None, 0
-        t_start = time.time()
-        masks = []
-        for page_idx, img in enumerate(images):
-            img_array = np.array(img)
-            mask = text_seg(img_array, verbose=False)
-            masks.append(mask)
-        elapsed_ms = int((time.time() - t_start) * 1000)
-        print(f"  [TextSeg] {len(masks)} pages in {elapsed_ms}ms")
-        return masks, elapsed_ms
-
-    # Start text segmentation immediately (parallel with everything else)
-    if text_seg is not None:
-        text_seg_future = _parallel_executor.submit(do_text_segmentation)
+    text_seg_future = None  # Will be started after we have the grid
 
     if inpaint_background and output_type != "text_only":
         # Detect label2 regions for inpainting + OCR/translate
@@ -623,6 +606,11 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
             inpaint_future = _parallel_executor.submit(do_inpainting)
     else:
         print(f"  [Detect] {len(bubbles)} bubbles in {detect_time:.0f}ms")
+
+    # DEBUG: Log detected bubbles
+    print(f"  [DEBUG Detected L1 Bubbles]")
+    for b in bubbles:
+        print(f"    page={b['page_idx']}, idx={b['bubble_idx']}, box={list(b['box'])}")
 
     stats["detect_ms"] = int(detect_time)
     stats["bubbles_detected"] = len(bubbles)
@@ -683,8 +671,42 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
     stats["ocr_lines"] = ocr_result.get('line_count', 0)
     is_translated = ocr_result.get('translated', False)
 
+    # Run text segmentation on FULL PAGES (not grid)
+    # Full page text_seg gives cleaner results - doesn't falsely detect bubble edges
+    if text_seg is not None and bubbles:
+        def do_text_segmentation_on_pages():
+            t_start = time.time()
+            page_masks = {}
+            for page_idx, img in enumerate(images):
+                page_array = np.array(img)
+                page_masks[page_idx] = text_seg(page_array, verbose=False)
+            elapsed_ms = int((time.time() - t_start) * 1000)
+            print(f"  [TextSeg] {len(images)} pages in {elapsed_ms}ms")
+            return page_masks, elapsed_ms
+        text_seg_future = _parallel_executor.submit(do_text_segmentation_on_pages)
+
     # Map OCR to bubbles
     bubble_texts = map_ocr(ocr_result, positions)
+
+    # DEBUG: Log OCR mapping details
+    print(f"  [DEBUG OCR Mapping]")
+    print(f"    OCR lines ({len(ocr_result.get('lines', []))} total):")
+    for i, line in enumerate(ocr_result.get('lines', [])):
+        cell_idx = line.get('cell_idx', '?')
+        text = line.get('text', '')[:25].replace('\n', '\\n')
+        print(f"      line[{i}]: cell_idx={cell_idx}, text='{text}'")
+
+    print(f"    Positions ({len(positions) if positions else 0} total):")
+    if positions:
+        for i, pos in enumerate(positions):
+            key = pos.get('key', '?')
+            bbox = pos.get('bubble_box', [])
+            print(f"      pos[{i}]: key={key}, bubble_box={bbox}")
+
+    print(f"    Mapped bubble_texts:")
+    for key, text_items in sorted(bubble_texts.items()):
+        texts = [t['text'][:20].replace('\n', '\\n') for t in text_items]
+        print(f"      {key}: {texts}")
 
     # Build OCR data structure per page
     ocr_data = {}
@@ -705,6 +727,13 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
     # Sort bubbles by idx
     for page_idx in ocr_data:
         ocr_data[page_idx].sort(key=lambda x: x['idx'])
+
+    # DEBUG: Log final OCR data
+    print(f"    Final ocr_data for rendering:")
+    for page_idx in sorted(ocr_data.keys()):
+        for bubble in ocr_data[page_idx]:
+            ocr_text = "".join([t['text'] for t in bubble['texts']])[:25].replace('\n', '\\n')
+            print(f"      Page {page_idx}, Bubble {bubble['idx']}: box={bubble['bubble_box']}, ocr='{ocr_text}'")
 
     # Wait for L2 OCR (if running)
     l2_ocr_result = None
@@ -730,6 +759,18 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
                         'bubble_box': list(b['box']),
                         'texts': text_items
                     })
+
+            # DEBUG: Log L2 OCR data
+            print(f"  [DEBUG L2 OCR Mapping]")
+            print(f"    L2 mapped bubble_texts: {len(l2_bubble_texts)} entries")
+            for key, text_items in sorted(l2_bubble_texts.items()):
+                texts = [t['text'][:20].replace('\n', '\\n') for t in text_items]
+                print(f"      {key}: {texts}")
+            print(f"    L2 ocr_data for rendering:")
+            for page_idx in sorted(l2_ocr_data.keys()):
+                for bubble in l2_ocr_data[page_idx]:
+                    ocr_text = "".join([t['text'] for t in bubble['texts']])[:25].replace('\n', '\\n')
+                    print(f"      Page {page_idx}, Bubble {bubble['idx']}: box={bubble['bubble_box']}, ocr='{ocr_text}'")
 
     # Sequential model loading: stop OCR server after ALL OCR is done (L1 + L2)
     if SEQUENTIAL_MODEL_LOADING and uses_vlm_ocr and HAS_VLM_OCR:
@@ -853,6 +894,26 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
                 translation_data[page_idx] = {}
             translation_data[page_idx][bubble_idx] = trans_text
 
+    # DEBUG: Log translation mapping
+    print(f"  [DEBUG Translation Mapping]")
+    print(f"    text_mapping ({len(text_mapping)} entries):")
+    for i, (page_idx, bubble_idx, is_l2) in enumerate(text_mapping):
+        src = all_texts[i][:20].replace('\n', '\\n') if i < len(all_texts) else '?'
+        trans = translations[i][:20].replace('\n', '\\n') if i < len(translations) else '?'
+        label = "L2" if is_l2 else "L1"
+        print(f"      [{i}] page={page_idx}, bubble={bubble_idx} ({label}): '{src}' → '{trans}'")
+
+    print(f"    L1 translation_data:")
+    for page_idx in sorted(translation_data.keys()):
+        for bubble_idx, trans in sorted(translation_data[page_idx].items()):
+            print(f"      Page {page_idx}, Bubble {bubble_idx}: '{trans[:30]}'")
+
+    if l2_translation_data:
+        print(f"    L2 translation_data:")
+        for page_idx in sorted(l2_translation_data.keys()):
+            for bubble_idx, trans in sorted(l2_translation_data[page_idx].items()):
+                print(f"      Page {page_idx}, Bubble {bubble_idx}: '{trans[:30]}'")
+
     # Handle different output types
     if output_type == "text_only":
         # Return just the data - no image rendering
@@ -906,7 +967,7 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
             bubble_images_output[page_idx] = []
             page_translations = translation_data.get(page_idx, {})
             img = source_images[page_idx]
-            page_mask = text_seg_masks[page_idx] if text_seg_masks and page_idx < len(text_seg_masks) else None
+            page_mask = text_seg_masks.get(page_idx) if text_seg_masks else None
 
             for bubble in page_bubbles:
                 # Create a copy of just the bubble area
@@ -969,7 +1030,6 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
             try:
                 text_seg_masks, text_seg_ms = text_seg_future.result(timeout=120)
                 stats["text_seg_ms"] = text_seg_ms
-                print(f"  [TextSeg] Completed {len(text_seg_masks) if text_seg_masks else 0} pages in {text_seg_ms}ms")
             except Exception as e:
                 print(f"  [TextSeg] Failed: {e}")
                 text_seg_masks = None
@@ -978,17 +1038,17 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
         # Note: L1 (text bubbles) are NOT inpainted - translated text is rendered directly
         source_images = inpainted_images if use_inpaint else images
 
-        # Render full pages (text_seg already done in parallel, just apply masks)
+        # Render full pages (text_seg already done on grid, masks mapped back)
         t0 = time.time()
         output_images = []
         render_timing = {}  # Collect detailed timing
         for page_idx, img in enumerate(source_images):
             img_copy = img.copy()
 
-            # Step 1: Render L1 bubbles (use pre-computed text_seg mask)
+            # Step 1: Render L1 bubbles (use pre-computed text_seg mask from grid)
             page_bubbles = ocr_data.get(page_idx, [])
             page_translations = translation_data.get(page_idx, {})
-            page_mask = text_seg_masks[page_idx] if text_seg_masks and page_idx < len(text_seg_masks) else None
+            page_mask = text_seg_masks.get(page_idx) if text_seg_masks else None
             rendered = render_text_on_image(img_copy, page_bubbles, page_translations, use_inpaint=use_inpaint, precomputed_mask=page_mask, timing=render_timing)
 
             # Step 2: Render L2 translations (no clearing - already inpainted)

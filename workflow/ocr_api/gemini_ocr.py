@@ -37,37 +37,53 @@ except ImportError:
     _HAS_GRID = False
 
 # Lazy import google-genai to avoid import errors if not installed
-_genai_client = None
+_genai_module = None
 _genai_types = None
 
 
-def _get_genai():
-    """Lazy load google-genai module."""
-    global _genai_client, _genai_types
-    if _genai_client is not None:
-        return _genai_client, _genai_types
+def _get_genai_module():
+    """Lazy load google-genai module (without creating client)."""
+    global _genai_module, _genai_types
+    if _genai_module is not None:
+        return _genai_module, _genai_types
 
     try:
         from google import genai
         from google.genai import types
-
-        # Get API key from environment or config
-        api_key = os.environ.get('GEMINI_API_KEY', '')
-        if not api_key:
-            from config import get_gemini_api_key
-            api_key = get_gemini_api_key()
-
-        if not api_key:
-            return None, None
-
-        _genai_client = genai.Client(api_key=api_key)
+        _genai_module = genai
         _genai_types = types
-        return _genai_client, _genai_types
+        return _genai_module, _genai_types
     except ImportError:
         return None, None
-    except Exception as e:
-        print(f"[Gemini OCR] Failed to initialize: {e}")
+
+
+def _get_client_with_key(api_key: str = None):
+    """Create a Gemini client with the specified (or rotated) API key."""
+    genai, types = _get_genai_module()
+    if genai is None:
         return None, None
+
+    # Get API key - use rotated key if not specified
+    if not api_key:
+        api_key = os.environ.get('GEMINI_API_KEY', '')
+    if not api_key:
+        from config import get_next_gemini_api_key
+        api_key = get_next_gemini_api_key()
+
+    if not api_key:
+        return None, None
+
+    try:
+        client = genai.Client(api_key=api_key)
+        return client, types
+    except Exception as e:
+        print(f"[Gemini OCR] Failed to create client: {e}")
+        return None, None
+
+
+def _get_genai():
+    """Legacy function - creates client with first available key."""
+    return _get_client_with_key()
 
 
 def check_gemini_available() -> bool:
@@ -183,12 +199,19 @@ class GeminiOCR:
         self._types = None
 
     def _ensure_client(self) -> bool:
-        """Ensure Gemini client is initialized."""
+        """Ensure Gemini client is initialized (legacy - uses first key)."""
         if self._client is not None:
             return True
 
         self._client, self._types = _get_genai()
         return self._client is not None
+
+    def _get_rotated_client(self):
+        """Get a client with a rotated API key for load balancing."""
+        client, types = _get_client_with_key()  # Uses get_next_gemini_api_key()
+        if types is not None:
+            self._types = types  # Cache types (doesn't need key)
+        return client
 
     def run(self, image: Image.Image, positions: List[Dict] = None,
             grid_info: Dict = None, translate: bool = False, max_retries: int = 4) -> Dict[str, Any]:
@@ -210,7 +233,9 @@ class GeminiOCR:
             return {'lines': [], 'line_count': 0, 'processing_time_ms': 0,
                     'translated': translate}
 
-        if not self._ensure_client():
+        # Get client with rotated API key for each call
+        client = self._get_rotated_client()
+        if client is None:
             return {'lines': [], 'line_count': 0, 'processing_time_ms': 0,
                     'error': 'Gemini API not available (check API key)', 'translated': translate}
 
@@ -231,8 +256,8 @@ class GeminiOCR:
                     self._types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
                 ]
 
-                # Make API request
-                response = self._client.models.generate_content(
+                # Make API request (using rotated client for load balancing)
+                response = client.models.generate_content(
                     model=self.model,
                     contents=content,
                     config={
@@ -364,19 +389,33 @@ class GeminiOCR:
         if len(bubbles) <= self.max_cells_per_batch:
             return self.run_grid(bubbles, row_width, padding, translate)
 
-        # Split into batches
+        # Split into batches - KEEP SAME PAGE BUBBLES TOGETHER
         t0 = time.time()
-        batches = []
-        for i in range(0, len(bubbles), self.max_cells_per_batch):
-            batch_bubbles = bubbles[i:i + self.max_cells_per_batch]
-            batches.append((i, batch_bubbles))
 
-        print(f"[Gemini OCR] Processing {len(bubbles)} bubbles in {len(batches)} parallel batches")
+        # Group bubbles by page_idx first
+        from collections import defaultdict
+        pages = defaultdict(list)
+        for b in bubbles:
+            pages[b['page_idx']].append(b)
+
+        # Create batches that respect page boundaries
+        batches = []
+        offset = 0
+        for page_idx in sorted(pages.keys()):
+            page_bubbles = pages[page_idx]
+            # Split large pages into sub-batches if needed
+            for i in range(0, len(page_bubbles), self.max_cells_per_batch):
+                batch_bubbles = page_bubbles[i:i + self.max_cells_per_batch]
+                batches.append((offset, batch_bubbles))
+                offset += len(batch_bubbles)
+
+        print(f"[Gemini OCR] Processing {len(bubbles)} bubbles in {len(batches)} batches (page-grouped)")
 
         # Process all batches in parallel
         def process_batch(batch_data):
             batch_idx, (offset, batch_bubbles) = batch_data
-            print(f"[Gemini OCR] Batch {batch_idx + 1}/{len(batches)} starting ({len(batch_bubbles)} bubbles)")
+            page_ids = set(b['page_idx'] for b in batch_bubbles)
+            print(f"[Gemini OCR] Batch {batch_idx + 1}/{len(batches)} starting ({len(batch_bubbles)} bubbles, pages={sorted(page_ids)})")
             result, positions, _ = self.run_grid(batch_bubbles, row_width, padding, translate)
             return offset, result, positions, batch_idx
 
