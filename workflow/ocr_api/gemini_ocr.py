@@ -94,9 +94,9 @@ def check_gemini_available() -> bool:
 
 # Available Gemma 3 models for vision/OCR tasks (via Google AI Studio)
 # Gemma 3 is multimodal and supports text + image input
-# NOTE: Only 27B IT model is recommended for OCR quality
 GEMMA_MODELS = {
     "gemma3_27b": "gemma-3-27b-it",      # Best quality, instruction-tuned 27B (RECOMMENDED)
+    "gemma3_12b": "gemma-3-12b-it",      # Fallback, smaller but faster
 }
 
 # Gemini models - cloud API options
@@ -109,6 +109,12 @@ GEMINI_MODELS = {
 ALL_MODELS = {**GEMMA_MODELS, **GEMINI_MODELS}
 
 DEFAULT_MODEL = "gemma-3-27b-it"  # Gemma 3 27B for best OCR quality
+
+# Fallback models when rate limited (model -> fallback)
+FALLBACK_MODELS = {
+    "gemma-3-27b-it": "gemma-3-12b-it",
+    "gemma-3-27b": "gemma-3-12b-it",
+}
 
 # Max cells per grid batch (same as VLM OCR - uses config value)
 
@@ -154,7 +160,8 @@ Output JSON only:
 No preamble or explanation."""
     else:
         if translate:
-            return f"""OCR and translate {n} manga speech bubbles in a grid image.
+            return f"""TASK: OCR and translate exactly {n} manga speech bubbles. Output MUST have exactly {n} entries (id 0 to {n-1}).
+
 Grid layout: BLUE lines = column separators, RED lines = row separators.
 Read cells left-to-right, top-to-bottom (cell 0 is top-left).
 
@@ -163,19 +170,22 @@ RULES:
 - Keep emotional punctuation: ！→!, ？→?, …→..., 〜→~
 - Each bubble is separate dialogue - maintain speaker distinction
 - Read vertical Japanese text top-to-bottom, right-to-left within each cell
+- NEVER repeat the same translation multiple times - each bubble has unique content
+- If a cell appears empty, output empty string "" for that id
 
-Output JSON only (exactly {n} entries):
+Output JSON with EXACTLY {n} bubbles (id 0 to {n-1}):
 {{
   "bubbles": [
-    {{"id": 0, "text": "translation"}},
-    {{"id": 1, "text": "translation"}},
+    {{"id": 0, "text": "translation for cell 0"}},
+    {{"id": 1, "text": "translation for cell 1"}},
     ...
-    {{"id": {n-1}, "text": "translation"}}
+    {{"id": {n-1}, "text": "translation for cell {n-1}"}}
   ]
 }}
 
-Translate to {target_lang}. No preamble."""
-        return f"""OCR {n} manga speech bubbles in a grid image.
+Translate to {target_lang}. IMPORTANT: Return exactly {n} entries. No more, no less. No preamble."""
+        return f"""TASK: OCR exactly {n} manga speech bubbles. Output MUST have exactly {n} entries (id 0 to {n-1}).
+
 Grid layout: BLUE lines = column separators, RED lines = row separators.
 Read cells left-to-right, top-to-bottom (cell 0 is top-left).
 
@@ -186,18 +196,20 @@ RULES:
 - Read vertical Japanese text top-to-bottom, right-to-left within each cell
 - Distinguish names from regular words (names often standalone or with particles like は, が, の)
 - If text is a name only (like 佳奈), output just the name
+- NEVER repeat the same text multiple times - each bubble has unique content
+- If a cell appears empty, output empty string "" for that id
 
-Output JSON only (exactly {n} entries):
+Output JSON with EXACTLY {n} bubbles (id 0 to {n-1}):
 {{
   "bubbles": [
-    {{"id": 0, "text": "exact text"}},
-    {{"id": 1, "text": "exact text"}},
+    {{"id": 0, "text": "text for cell 0"}},
+    {{"id": 1, "text": "text for cell 1"}},
     ...
-    {{"id": {n-1}, "text": "exact text"}}
+    {{"id": {n-1}, "text": "text for cell {n-1}"}}
   ]
 }}
 
-No preamble or explanation."""
+IMPORTANT: Return exactly {n} entries. No more, no less. No preamble."""
 
 
 def _parse_gemini_output(output: str, num_expected: int) -> Dict[int, str]:
@@ -287,6 +299,52 @@ def _parse_gemini_output(output: str, num_expected: int) -> Dict[int, str]:
     return cell_texts
 
 
+def _detect_repetition_loop(output: str, threshold: int = 5) -> bool:
+    """Detect if output contains repetitive loops (model stuck).
+
+    Args:
+        output: The raw output string from the model
+        threshold: Minimum repetitions to consider it a loop
+
+    Returns:
+        True if repetitive loop detected, False otherwise
+    """
+    if not output or len(output) < 50:
+        return False
+
+    # Check for repeated short patterns (2-30 chars) appearing many times
+    for pattern_len in range(2, 31):
+        # Look for patterns that repeat
+        for start in range(min(100, len(output) - pattern_len)):
+            pattern = output[start:start + pattern_len]
+            # Skip patterns that are just whitespace or single chars repeated
+            if len(set(pattern.replace('\n', '').replace(' ', ''))) <= 1:
+                continue
+            # Count occurrences
+            count = output.count(pattern)
+            if count >= threshold:
+                # Verify it's actually repetitive (not just common words)
+                # Check if the pattern appears consecutively
+                consecutive = pattern + pattern
+                if output.count(consecutive) >= threshold - 1:
+                    return True
+
+    # Check for very long output relative to expected (likely runaway)
+    # If output > 1000 chars and has lots of newlines with similar content
+    if len(output) > 1000:
+        lines = output.split('\n')
+        if len(lines) > 20:
+            # Check if many lines are identical or very similar
+            from collections import Counter
+            line_counts = Counter(line.strip() for line in lines if line.strip())
+            if line_counts:
+                most_common_count = line_counts.most_common(1)[0][1]
+                if most_common_count >= threshold:
+                    return True
+
+    return False
+
+
 class GeminiOCR:
     """Gemma 3 / Gemini API-based OCR for manga/manhwa bubble text extraction.
 
@@ -356,6 +414,7 @@ class GeminiOCR:
         prompt = _build_ocr_prompt(grid_info, translate=translate)
         expected_cells = grid_info.get('total_cells', len(positions) if positions else 1)
         last_error = None
+        current_model = self.model  # Can switch to fallback on rate limit
 
         for attempt in range(max_retries + 1):
             try:
@@ -368,7 +427,7 @@ class GeminiOCR:
 
                 # Make API request (using rotated client for load balancing)
                 response = client.models.generate_content(
-                    model=self.model,
+                    model=current_model,
                     contents=content,
                     config={
                         "temperature": 0.3 + (attempt * 0.05),  # Increase temp on retry
@@ -377,6 +436,14 @@ class GeminiOCR:
                 )
 
                 output = response.text if hasattr(response, 'text') else str(response)
+
+                # Check for repetition loop (model stuck)
+                if _detect_repetition_loop(output):
+                    print(f"[Gemini OCR] Repetition loop detected, retry {attempt + 1}/{max_retries}")
+                    last_error = "repetition_loop_detected"
+                    if attempt < max_retries:
+                        time.sleep(0.5)
+                        continue
 
                 # Parse output
                 cell_texts = _parse_gemini_output(output, expected_cells)
@@ -432,6 +499,8 @@ class GeminiOCR:
 
             except Exception as e:
                 last_error = str(e)
+                error_str = str(e).lower()
+
                 # Print detailed error info
                 error_msg = f"[Gemini OCR] Error (attempt {attempt + 1}/{max_retries + 1}): {type(e).__name__}: {e}"
                 print(error_msg)
@@ -442,9 +511,21 @@ class GeminiOCR:
                     print(f"[Gemini OCR] Status code: {e.status_code}")
                 if hasattr(e, 'message'):
                     print(f"[Gemini OCR] Message: {e.message}")
+
+                # Check for rate limit error (429) and switch to fallback model
+                is_rate_limited = ('429' in error_str or 'resource_exhausted' in error_str or
+                                   'quota' in error_str or 'rate' in error_str)
+                if is_rate_limited and current_model in FALLBACK_MODELS:
+                    fallback = FALLBACK_MODELS[current_model]
+                    print(f"[Gemini OCR] Rate limited on {current_model}, switching to fallback: {fallback}")
+                    current_model = fallback
+
                 if attempt < max_retries:
                     # Exponential backoff for rate limiting
-                    time.sleep(1 * (attempt + 1))
+                    wait_time = 1 * (attempt + 1)
+                    if is_rate_limited:
+                        wait_time = max(wait_time, 2)  # At least 2s for rate limits
+                    time.sleep(wait_time)
 
         print(f"[Gemini OCR] All retries failed. Last error: {last_error}")
         return {'lines': [], 'line_count': 0, 'processing_time_ms': (time.time() - t0) * 1000,
