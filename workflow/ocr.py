@@ -66,17 +66,30 @@ class OneOCRRemote:
             self._available = False
         return self._available
 
-    def run(self, image):
-        """Run OCR on a single image."""
+    def run(self, image, quality=95):
+        """Run OCR on a single image.
+
+        Args:
+            image: PIL Image
+            quality: JPEG quality (1-100). Higher = better quality, larger file.
+                     95 is a good balance for OCR (sharp text, ~3-5x smaller than PNG)
+        """
         import base64
         buf = io.BytesIO()
-        image.save(buf, format='PNG')
+
+        # Convert to RGB if needed (JPEG doesn't support RGBA)
+        if image.mode in ('RGBA', 'P'):
+            image = image.convert('RGB')
+
+        # Use JPEG for smaller payload (much faster over network)
+        # Quality 95 preserves text sharpness while being ~3-5x smaller than PNG
+        image.save(buf, format='JPEG', quality=quality, optimize=True)
         img_b64 = base64.b64encode(buf.getvalue()).decode()
 
         resp = requests.post(
             f"{self.server_url}/ocr",
             json={"image": img_b64},
-            timeout=30
+            timeout=60  # 60s for large grids with many bubbles
         )
         resp.raise_for_status()
         data = resp.json()
@@ -101,7 +114,20 @@ class OneOCRRemote:
         return {'lines': lines, 'line_count': len(lines)}
 
     def run_batched(self, bubbles, row_width=1600, padding=10, translate=False):
-        """Run OCR on multiple bubbles using grid (like Windows OneOCR)."""
+        """Run OCR on multiple bubbles using grid (like Windows OneOCR).
+
+        Args:
+            bubbles: List of bubble dicts with 'image' key
+            row_width: Max width for grid rows
+            padding: Padding between cells
+            translate: Not supported for OneOCR (ignored)
+
+        Returns:
+            (ocr_result, positions, grid_image)
+        """
+        if not bubbles:
+            return {'lines': [], 'line_count': 0}, [], None
+
         # Create grid from bubbles
         grid_img, positions = grid_bubbles(bubbles, row_width, padding)
 
