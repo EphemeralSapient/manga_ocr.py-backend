@@ -12,6 +12,7 @@ import io
 import os
 import re
 import time
+import random
 from typing import List, Dict, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -448,16 +449,13 @@ class GeminiOCR:
                 # Parse output
                 cell_texts = _parse_gemini_output(output, expected_cells)
 
-                # Check for missing cells
+                # Log missing cells (but don't retry here - run_grid handles targeted retries)
                 missing = set(range(expected_cells)) - set(cell_texts.keys())
-                if missing and attempt < max_retries:
+                if missing:
                     missing_str = ','.join(str(i) for i in sorted(missing)[:5])
                     if len(missing) > 5:
                         missing_str += f"...+{len(missing)-5}more"
-                    print(f"[Gemini OCR] Missing cells [{missing_str}], retry {attempt + 1}/{max_retries}")
-                    last_error = f"missing_cells:[{missing_str}]"
-                    time.sleep(0.5)
-                    continue
+                    print(f"[Gemini OCR] Missing cells [{missing_str}] (will retry in run_grid)")
 
                 # Log raw output
                 if output:
@@ -532,7 +530,8 @@ class GeminiOCR:
                 'translated': translate, 'error': last_error}
 
     def run_grid(self, bubbles: List[Dict], row_width: int = 1600,
-                 padding: int = 10, translate: bool = False) -> Tuple[Dict, List[Dict], Image.Image]:
+                 padding: int = 10, translate: bool = False,
+                 max_missing_retries: int = 2) -> Tuple[Dict, List[Dict], Image.Image]:
         """Create grid and run OCR in one call (matches VlmOCR.run_grid).
 
         Args:
@@ -540,6 +539,7 @@ class GeminiOCR:
             row_width: Max width for grid rows
             padding: Padding between cells
             translate: If True, translate to target language
+            max_missing_retries: Max retries for missing cells only
 
         Returns:
             Tuple of (ocr_result, positions, grid_image)
@@ -556,6 +556,51 @@ class GeminiOCR:
 
         # Run OCR on grid
         ocr_result = self.run(grid_img, positions, grid_info, translate=translate)
+
+        # Check for missing cells and retry only those
+        expected_cells = len(bubbles)
+        parsed_cells = {line['cell_idx'] for line in ocr_result.get('lines', [])}
+        missing_indices = set(range(expected_cells)) - parsed_cells
+
+        retry_count = 0
+        while missing_indices and retry_count < max_missing_retries:
+            retry_count += 1
+            print(f"[Gemini OCR] Retrying {len(missing_indices)} missing cells (attempt {retry_count}/{max_missing_retries})")
+
+            # Collect bubble images for missing cells
+            missing_bubbles = [bubbles[i] for i in sorted(missing_indices)]
+
+            # Create smaller grid with just missing bubbles
+            retry_grid_img, retry_positions, retry_grid_info = create_ocr_grid(
+                missing_bubbles, row_width, padding
+            )
+
+            # Run OCR on smaller grid
+            retry_result = self.run(retry_grid_img, retry_positions, retry_grid_info, translate=translate)
+
+            # Map retry results back to original indices
+            missing_indices_list = sorted(missing_indices)
+            for line in retry_result.get('lines', []):
+                retry_cell_idx = line['cell_idx']
+                if retry_cell_idx < len(missing_indices_list):
+                    # Map back to original index
+                    original_idx = missing_indices_list[retry_cell_idx]
+                    line['cell_idx'] = original_idx
+                    ocr_result['lines'].append(line)
+                    parsed_cells.add(original_idx)
+
+            # Update missing indices
+            missing_indices = set(range(expected_cells)) - parsed_cells
+
+            if missing_indices:
+                print(f"[Gemini OCR] Still missing {len(missing_indices)} cells after retry {retry_count}")
+
+        # Update line count
+        ocr_result['line_count'] = len(ocr_result.get('lines', []))
+
+        # Sort lines by cell_idx for consistent ordering
+        ocr_result['lines'] = sorted(ocr_result.get('lines', []), key=lambda x: x.get('cell_idx', 0))
+
         return ocr_result, positions, grid_img
 
     def run_batched(self, bubbles: List[Dict], row_width: int = 1600,
@@ -602,15 +647,20 @@ class GeminiOCR:
 
         print(f"[Gemini OCR] Processing {len(bubbles)} bubbles in {len(batches)} batches (page-grouped)")
 
-        # Process all batches in parallel
+        # Process all batches in parallel with staggered delays to avoid spam detection
         def process_batch(batch_data):
             batch_idx, (offset, batch_bubbles) = batch_data
+            # Stagger start times: random delay 0.1-0.5s per batch index to spread out requests
+            stagger_delay = batch_idx * random.uniform(0.1, 0.5)
+            if stagger_delay > 0:
+                time.sleep(stagger_delay)
             page_ids = set(b['page_idx'] for b in batch_bubbles)
             print(f"[Gemini OCR] Batch {batch_idx + 1}/{len(batches)} starting ({len(batch_bubbles)} bubbles, pages={sorted(page_ids)})")
             result, positions, _ = self.run_grid(batch_bubbles, row_width, padding, translate)
             return offset, result, positions, batch_idx
 
         results = [None] * len(batches)
+        failed_batches = []  # Track failed/incomplete batches
         with ThreadPoolExecutor(max_workers=len(batches)) as executor:
             futures = {executor.submit(process_batch, (idx, batch)): idx for idx, batch in enumerate(batches)}
             for future in as_completed(futures):
@@ -618,9 +668,44 @@ class GeminiOCR:
                 try:
                     offset, result, positions, batch_idx = future.result()
                     results[batch_idx] = (offset, result, positions)
-                    print(f"[Gemini OCR] Batch {batch_idx + 1}/{len(batches)} completed ({result.get('line_count', 0)} lines)")
+
+                    # Track issues in this batch
+                    batch_bubbles = batches[batch_idx][1]
+                    expected_count = len(batch_bubbles)
+                    actual_count = result.get('line_count', 0)
+                    page_ids = sorted(set(b['page_idx'] for b in batch_bubbles))
+
+                    if result.get('error'):
+                        failed_batches.append({
+                            'batch': batch_idx + 1,
+                            'pages': page_ids,
+                            'expected': expected_count,
+                            'actual': actual_count,
+                            'error': result.get('error')
+                        })
+                        print(f"[Gemini OCR] Batch {batch_idx + 1}/{len(batches)} had error: {result.get('error')}")
+                    elif actual_count < expected_count:
+                        failed_batches.append({
+                            'batch': batch_idx + 1,
+                            'pages': page_ids,
+                            'expected': expected_count,
+                            'actual': actual_count,
+                            'missing': expected_count - actual_count
+                        })
+                        print(f"[Gemini OCR] Batch {batch_idx + 1}/{len(batches)} incomplete: {actual_count}/{expected_count} cells")
+                    else:
+                        print(f"[Gemini OCR] Batch {batch_idx + 1}/{len(batches)} completed ({actual_count} lines)")
                 except Exception as e:
                     print(f"[Gemini OCR] Batch {future_idx + 1}/{len(batches)} failed: {type(e).__name__}: {e}")
+                    batch_bubbles = batches[future_idx][1]
+                    page_ids = sorted(set(b['page_idx'] for b in batch_bubbles))
+                    failed_batches.append({
+                        'batch': future_idx + 1,
+                        'pages': page_ids,
+                        'expected': len(batch_bubbles),
+                        'actual': 0,
+                        'error': str(e)
+                    })
                     results[future_idx] = (batches[future_idx][0], {'lines': [], 'error': str(e)}, [])
 
         # Merge results
@@ -634,12 +719,20 @@ class GeminiOCR:
                 pos['cell_idx'] = pos.get('cell_idx', 0) + offset
             all_positions.extend(positions)
 
+        # Summary of issues
+        if failed_batches:
+            print(f"[Gemini OCR] WARNING: {len(failed_batches)} batches had issues")
+            for fb in failed_batches:
+                issue = fb.get('error') or f"missing {fb.get('missing', 0)} cells"
+                print(f"  - Batch {fb['batch']} (pages {fb['pages']}): {issue}")
+
         return {
             'lines': all_lines,
             'line_count': len(all_lines),
             'processing_time_ms': (time.time() - t0) * 1000,
             'translated': translate,
-            'batch_count': len(batches)
+            'batch_count': len(batches),
+            'failed_batches': failed_batches if failed_batches else None
         }, all_positions, None
 
 

@@ -669,6 +669,9 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
     stats["grid_size"] = f"{grid.width}x{grid.height}" if grid else "batched"
     stats["ocr_ms"] = ocr_time
     stats["ocr_lines"] = ocr_result.get('line_count', 0)
+    # Track failed/incomplete OCR batches
+    if ocr_result.get('failed_batches'):
+        stats["ocr_failed_batches"] = ocr_result['failed_batches']
     is_translated = ocr_result.get('translated', False)
 
     # Run text segmentation on FULL PAGES (not grid)
@@ -743,6 +746,9 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
         if l2_ocr_result:
             stats["ocr_l2_ms"] = l2_ocr_time
             stats["ocr_l2_lines"] = l2_ocr_result.get('line_count', 0)
+            # Track failed/incomplete L2 OCR batches
+            if l2_ocr_result.get('failed_batches'):
+                stats["ocr_l2_failed_batches"] = l2_ocr_result['failed_batches']
 
             # Map L2 OCR to bubbles
             l2_bubble_texts = map_ocr(l2_ocr_result, l2_positions)
