@@ -58,22 +58,28 @@ COREML_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 # Provider-specific configurations
 PROVIDER_CONFIGS = {
     'NvTensorRTRTXExecutionProvider': {
-        'trt_max_workspace_size': 2 * 1024 * 1024 * 1024,  # 2GB
+        'trt_max_workspace_size': 4 * 1024 * 1024 * 1024,  # 4GB - more tactics for better optimization
         'trt_fp16_enable': True,
         'trt_engine_cache_enable': True,
         'trt_engine_cache_path': TRT_CACHE_DIR,
         'trt_timing_cache_enable': True,
         'trt_timing_cache_path': TRT_CACHE_DIR,
+        'trt_force_timing_cache': True,  # Accept slight GPU mismatch within same compute capability
         'trt_builder_optimization_level': 3,  # Max optimization
+        'trt_cuda_graph_enable': True,  # Reduce CPU launch overhead for many small layers
+        'trt_context_memory_sharing_enable': True,  # Share memory between TRT subgraphs
     },
     'TensorrtExecutionProvider': {
-        'trt_max_workspace_size': 2 * 1024 * 1024 * 1024,  # 2GB
+        'trt_max_workspace_size': 4 * 1024 * 1024 * 1024,  # 4GB - more tactics for better optimization
         'trt_fp16_enable': True,
         'trt_engine_cache_enable': True,
         'trt_engine_cache_path': TRT_CACHE_DIR,
         'trt_timing_cache_enable': True,
         'trt_timing_cache_path': TRT_CACHE_DIR,
+        'trt_force_timing_cache': True,  # Accept slight GPU mismatch within same compute capability
         'trt_builder_optimization_level': 3,  # Max optimization
+        'trt_cuda_graph_enable': True,  # Reduce CPU launch overhead for many small layers
+        'trt_context_memory_sharing_enable': True,  # Share memory between TRT subgraphs
     },
     'CUDAExecutionProvider': {
         'device_id': 0,
@@ -84,7 +90,11 @@ PROVIDER_CONFIGS = {
         'device_id': 0,
     },
     'OpenVINOExecutionProvider': {
-        'device_type': 'GPU_FP16',
+        'device_type': 'AUTO',  # AUTO selects best available (GPU/NPU/CPU)
+        'precision': 'FP16',  # FP16 for GPU/NPU, FP32 for CPU
+        'num_of_threads': 8,  # CPU inference threads
+        'num_streams': 1,  # 1 for latency, higher for throughput
+        'cache_dir': os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.openvino_cache'),
     },
     'CoreMLExecutionProvider': {
         'ModelFormat': 'MLProgram',   # MLProgram (iOS 15+/macOS 12+) or NeuralNetwork (iOS 13+/macOS 10.15+)
@@ -178,11 +188,20 @@ def create_session(
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-    # Determine provider
+    # Determine provider first (needed for provider-specific session options)
     if provider is None:
         provider, name = get_best_provider()
     else:
         name = dict(PROVIDER_PRIORITY).get(provider, provider)
+
+    # DirectML requires memory pattern disabled and sequential execution
+    if provider == 'DmlExecutionProvider':
+        opts.enable_mem_pattern = False
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+    # OpenVINO performs its own optimizations - disable ORT graph optimization for best results
+    if provider == 'OpenVINOExecutionProvider':
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
 
     # Build provider list with configs
     if provider in PROVIDER_CONFIGS:
@@ -192,6 +211,8 @@ def create_session(
             os.makedirs(config['trt_engine_cache_path'], exist_ok=True)
         if 'ModelCacheDirectory' in config:
             os.makedirs(config['ModelCacheDirectory'], exist_ok=True)
+        if 'cache_dir' in config:
+            os.makedirs(config['cache_dir'], exist_ok=True)
         providers = [(provider, config)]
     else:
         providers = [provider]

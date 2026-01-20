@@ -37,9 +37,124 @@ except:
 _local_ocr = None
 _vlm_ocr = None
 _gemini_ocr = None
+_remote_ocr = None
 _vlm_checked = False  # Track if we've done runtime check
 _gemini_checked = False
+_remote_checked = False
 OCR_URL = "http://localhost:1377/ocr"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OneOCR Remote Client
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OneOCRRemote:
+    """Client for remote OneOCR server."""
+
+    def __init__(self, server_url):
+        self.server_url = server_url.rstrip('/')
+        self._available = None
+
+    def check_available(self):
+        """Check if remote server is reachable."""
+        if self._available is not None:
+            return self._available
+        try:
+            resp = requests.get(f"{self.server_url}/health", timeout=5)
+            self._available = resp.status_code == 200
+        except:
+            self._available = False
+        return self._available
+
+    def run(self, image):
+        """Run OCR on a single image."""
+        import base64
+        buf = io.BytesIO()
+        image.save(buf, format='PNG')
+        img_b64 = base64.b64encode(buf.getvalue()).decode()
+
+        resp = requests.post(
+            f"{self.server_url}/ocr",
+            json={"image": img_b64},
+            timeout=30
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not data.get('success'):
+            raise Exception(data.get('error', 'Unknown error'))
+
+        # Convert remote format to local format
+        lines = []
+        for result in data.get('results', []):
+            lines.append({
+                'text': result.get('text', ''),
+                'bbox': {
+                    'x': result.get('bbox', [0, 0, 0, 0])[0],
+                    'y': result.get('bbox', [0, 0, 0, 0])[1],
+                    'width': result.get('bbox', [0, 0, 0, 0])[2] - result.get('bbox', [0, 0, 0, 0])[0],
+                    'height': result.get('bbox', [0, 0, 0, 0])[3] - result.get('bbox', [0, 0, 0, 0])[1],
+                },
+                'confidence': result.get('confidence', 1.0)
+            })
+
+        return {'lines': lines, 'line_count': len(lines)}
+
+    def run_batched(self, bubbles, row_width=1600, padding=10, translate=False):
+        """Run OCR on multiple bubbles using grid (like Windows OneOCR)."""
+        # Create grid from bubbles
+        grid_img, positions = grid_bubbles(bubbles, row_width, padding)
+
+        # Run OCR on grid
+        ocr_result = self.run(grid_img)
+
+        return ocr_result, positions, grid_img
+
+
+def _get_remote_ocr_url():
+    """Get configured remote OneOCR server URL."""
+    try:
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        from config import get_oneocr_server_url
+        return get_oneocr_server_url()
+    except:
+        return ""
+
+
+def _check_remote_ocr_available():
+    """Check if remote OneOCR is available."""
+    global _remote_checked, _remote_ocr
+    if _remote_checked:
+        return _remote_ocr is not None and _remote_ocr.check_available()
+
+    url = _get_remote_ocr_url()
+    if not url:
+        return False
+
+    try:
+        _remote_ocr = OneOCRRemote(url)
+        available = _remote_ocr.check_available()
+        if available:
+            _remote_checked = True
+        return available
+    except:
+        return False
+
+
+def _get_remote_ocr():
+    """Get remote OneOCR instance."""
+    global _remote_ocr
+    if not _check_remote_ocr_available():
+        return None
+    return _remote_ocr
+
+
+def reset_remote_ocr():
+    """Reset remote OneOCR client."""
+    global _remote_ocr, _remote_checked
+    _remote_ocr = None
+    _remote_checked = False
 
 
 def reset_vlm_ocr():
@@ -91,6 +206,7 @@ def _check_vlm_available():
 HAS_LFM_OCR = _HAS_VLM_MODULE  # Module available (runtime check done in _get_vlm_ocr)
 HAS_VLM_OCR = _HAS_VLM_MODULE
 HAS_GEMINI_OCR = _HAS_GEMINI_MODULE
+HAS_REMOTE_OCR = True  # Always available (just needs server URL configured)
 HAS_LOCAL_OCR = HAS_WINDOWS_OCR if IS_WINDOWS else HAS_VLM_OCR
 
 
@@ -237,16 +353,18 @@ def _get_configured_ocr_method():
     try:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-        from config import get_ocr_method, is_api_ocr_method
-        return get_ocr_method(), is_api_ocr_method(get_ocr_method())
+        from config import get_ocr_method, is_api_ocr_method, is_remote_ocr_method
+        method = get_ocr_method()
+        return method, is_api_ocr_method(method), is_remote_ocr_method(method)
     except:
-        return "qwen_vlm", False
+        return "qwen_vlm", False, False
 
 
 def run_ocr_on_bubbles(bubbles, row_width=1600, padding=10, ocr_url=OCR_URL, translate=False):
     """
     High-level OCR: create grid and run OCR in one call.
 
+    For OneOCR Remote: Sends grid to remote Windows server.
     For Gemini API: Sends individual bubble images directly (no grid needed).
     For VLM OCR: Uses colored separator grid with batched processing.
     For Windows/HTTP: Uses standard grid.
@@ -260,7 +378,20 @@ def run_ocr_on_bubbles(bubbles, row_width=1600, padding=10, ocr_url=OCR_URL, tra
 
     Returns: (ocr_result, positions, grid_image)
     """
-    ocr_method, is_api = _get_configured_ocr_method()
+    ocr_method, is_api, is_remote = _get_configured_ocr_method()
+
+    # Try OneOCR Remote if configured (doesn't support translate mode)
+    if is_remote and ocr_method == "oneocr_remote" and not translate:
+        remote = _get_remote_ocr()
+        if remote:
+            try:
+                ocr_result, positions, grid_img = remote.run_batched(
+                    bubbles, row_width=row_width, padding=padding, translate=translate
+                )
+                return ocr_result, positions, grid_img
+            except Exception as e:
+                print(f"[OCR] OneOCR Remote error: {e}")
+                # Fall through to try other backends
 
     # Try Gemini API OCR if configured
     if is_api and ocr_method == "gemini_api":

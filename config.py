@@ -56,8 +56,12 @@ DEFAULT_CONFIG = {
     # User Settings (shown in wizard)
     # ══════════════════════════════════════════════════════════════════════════
 
-    # OCR method: "qwen_vlm" | "lfm_vlm" | "ministral_vlm_q8" | "gemini_api" | "oneocr"
+    # OCR method: "qwen_vlm" | "lfm_vlm" | "ministral_vlm_q8" | "gemini_api" | "oneocr" | "oneocr_remote"
     "ocr_method": "qwen_vlm",
+
+    # OneOCR remote server URL (for oneocr_remote method)
+    # Run oneocr_server/server.py on a Windows machine to get the URL
+    "oneocr_server_url": "",
 
     # Translation method: "hunyuan_mt" | "cerebras_api"
     # Note: VLM translation (qwen_vlm) disabled due to hallucination issues
@@ -375,8 +379,8 @@ def needs_llama() -> bool:
     """Check if current config needs llama.cpp."""
     ocr = get_ocr_method()
     translate = get_translate_method()
-    # API-based OCR doesn't need llama.cpp
-    if ocr in API_OCR_METHODS:
+    # API-based and remote OCR don't need llama.cpp
+    if ocr in API_OCR_METHODS or ocr in REMOTE_OCR_METHODS or ocr == "oneocr":
         ocr_needs_llama = False
     else:
         ocr_needs_llama = ocr in VLM_METHODS
@@ -393,6 +397,9 @@ VLM_METHODS = ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8")
 # API-based OCR methods (cloud services, no local GPU needed)
 API_OCR_METHODS = ("gemini_api",)
 
+# Remote OCR methods (network services)
+REMOTE_OCR_METHODS = ("oneocr_remote",)
+
 def is_vlm_method(method: str) -> bool:
     """Check if method is a local VLM-based method (needs llama.cpp)."""
     return method in VLM_METHODS
@@ -400,6 +407,16 @@ def is_vlm_method(method: str) -> bool:
 def is_api_ocr_method(method: str) -> bool:
     """Check if method is an API-based OCR method (cloud service)."""
     return method in API_OCR_METHODS
+
+
+def is_remote_ocr_method(method: str) -> bool:
+    """Check if method is a remote OCR method (network service)."""
+    return method in REMOTE_OCR_METHODS
+
+
+def get_oneocr_server_url() -> str:
+    """Get OneOCR remote server URL."""
+    return get("oneocr_server_url", "")
 
 def get_target_language_name() -> str:
     """Get the full name of the target language."""
@@ -682,13 +699,55 @@ def run_wizard() -> dict:
         ]
 
         api_ocr_options = [
+            ("oneocr_remote", "OneOCR Remote [cyan](Windows server on network)[/] - Fastest, most accurate"),
             ("gemini_api:gemma-3-27b-it", "Gemma 3 27B IT [green](14.4k req/day)[/] - Best for free tier"),
             ("gemini_api:gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite [red](20 req/day)[/] - Fast but limited"),
             ("gemini_api:gemini-3-flash-preview", "Gemini 3 Flash Preview [red](20 req/day)[/] - Newest but limited"),
         ]
 
         if PY == 'Windows':
-            local_ocr_options.insert(0, ("oneocr", "OneOCR [green](no VRAM, Windows only)[/] - Fastest & most accurate"))
+            # Check if OneOCR is available (files exist or can get admin)
+            oneocr_available = False
+            oneocr_files_exist = os.path.exists(os.path.join(os.path.dirname(__file__), 'workflow', 'ocr', 'oneocr.dll'))
+
+            if oneocr_files_exist:
+                oneocr_available = True
+            else:
+                # Only show OneOCR if currently running as admin (can set up now)
+                try:
+                    import ctypes
+                    oneocr_available = bool(ctypes.windll.shell32.IsUserAnAdmin())
+                except:
+                    oneocr_available = False
+
+            if oneocr_available:
+                local_ocr_options.insert(0, ("oneocr", "OneOCR [green](no VRAM, Windows only)[/] - Fastest & most accurate"))
+                if not oneocr_files_exist:
+                    console.print(Panel(
+                        "[bold green]Windows Detected - OneOCR Recommended[/]\n\n"
+                        "[bold]OneOCR[/] uses Windows' built-in Snipping Tool OCR engine:\n"
+                        "  [green]+[/] [bold]10x faster[/] than local VLM models\n"
+                        "  [green]+[/] [bold]Most accurate[/] for manga/comic text\n"
+                        "  [green]+[/] [bold]No GPU/VRAM required[/]\n"
+                        "  [green]+[/] Works offline\n\n"
+                        "[yellow]⚠ Requires one-time Admin access[/]\n"
+                        "  Setup will request Administrator privileges to copy OCR files\n"
+                        "  from Windows Snipping Tool. You can Accept or Decline.\n\n"
+                        "[dim]If declined, you'll need to use Local VLM or API options,\n"
+                        "which are significantly slower (~10x) for OCR.[/]",
+                        title="[bold cyan]OneOCR Setup[/]",
+                        border_style="cyan"
+                    ))
+            else:
+                console.print(Panel(
+                    "[bold yellow]OneOCR Not Available[/]\n\n"
+                    "OneOCR requires Administrator access to set up, but admin\n"
+                    "privileges are not available in this session.\n\n"
+                    "[dim]To use OneOCR, run the config wizard as Administrator.\n"
+                    "For now, please choose from Local VLM or API options below.[/]",
+                    title="[yellow]Windows OCR[/]",
+                    border_style="yellow"
+                ))
 
         if setup_type == "local":
             ocr_options = local_ocr_options
@@ -696,12 +755,16 @@ def run_wizard() -> dict:
         elif setup_type == "api":
             ocr_options = api_ocr_options
             console.print(Panel(
+                "[bold cyan]OneOCR Remote[/] (Recommended if you have Windows access)\n"
+                "  [green]+[/] Fastest & most accurate OCR\n"
+                "  [green]+[/] No rate limits - runs on your own Windows machine\n"
+                "  [green]+[/] Works with Azure free tier Windows VM\n\n"
                 "[bold]API Rate Limits (Free Tier):[/]\n"
-                "  [green]gemma-3-27b-it[/]: 14,400 requests/day - [bold]Recommended for free use[/]\n"
-                "  [red]gemini-2.5-flash-lite[/]: 20 requests/day - Too limited for practical use\n"
-                "  [red]gemini-3-flash-preview[/]: 20 requests/day - Too limited for practical use\n\n"
-                "[dim]Get API key at: https://aistudio.google.com/apikey[/]",
-                title="[yellow]Rate Limits[/]",
+                "  [green]gemma-3-27b-it[/]: 14,400 requests/day - Good for free use\n"
+                "  [red]gemini-2.5-flash-lite[/]: 20 requests/day - Too limited\n"
+                "  [red]gemini-3-flash-preview[/]: 20 requests/day - Too limited\n\n"
+                "[dim]Gemini key: https://aistudio.google.com/apikey[/]",
+                title="[yellow]OCR Options[/]",
                 border_style="yellow"
             ))
         else:  # mixed
@@ -725,8 +788,45 @@ def run_wizard() -> dict:
         if ocr_choice.startswith("gemini_api:"):
             cfg["ocr_method"] = "gemini_api"
             cfg["gemini_model"] = ocr_choice.split(":", 1)[1]
+        elif ocr_choice == "oneocr_remote":
+            cfg["ocr_method"] = "oneocr_remote"
         else:
             cfg["ocr_method"] = ocr_choice
+
+        # OneOCR Remote server URL
+        if cfg["ocr_method"] == "oneocr_remote":
+            console.print(Panel(
+                "[bold cyan]OneOCR Remote Server Setup[/]\n\n"
+                "Run OneOCR on a Windows machine and connect to it over the network.\n"
+                "This gives you the fastest, most accurate OCR without needing Windows locally.\n\n"
+                "[bold]Step 1: Copy files to Windows machine[/]\n"
+                "  Copy the entire [cyan]oneocr_server/[/] folder to your Windows machine.\n"
+                "  Location: [dim]" + os.path.join(os.path.dirname(__file__), 'oneocr_server') + "[/]\n\n"
+                "[bold]Step 2: Run server (first time needs Administrator)[/]\n"
+                "  [cyan]cd oneocr_server[/]\n"
+                "  [cyan]python server.py[/]\n\n"
+                "  First run will:\n"
+                "  • Request Administrator access (to copy Windows OCR files)\n"
+                "  • Install Flask if needed\n"
+                "  • Display the Network URL\n\n"
+                "[bold]Step 3: Note the Network URL[/]\n"
+                "  Server will display something like:\n"
+                "  [green]Network URL:  http://192.168.1.50:5050[/]\n\n"
+                "[bold]Step 4: Enter URL below[/]\n"
+                "  Paste the Network URL when prompted.\n\n"
+                "[bold yellow]Azure Free Tier Option:[/]\n"
+                "  Create a free Windows VM (B1s tier) on Azure and run the server there.\n"
+                "  Open port 5050 in the VM's Network Security Group.",
+                title="[bold]OneOCR Remote Setup Guide[/]",
+                border_style="cyan"
+            ))
+            cfg["oneocr_server_url"] = prompt_input(
+                "OneOCR Server URL",
+                cfg.get("oneocr_server_url", "http://192.168.1.x:5050")
+            )
+            if not cfg["oneocr_server_url"] or cfg["oneocr_server_url"] == "http://192.168.1.x:5050":
+                cfg["oneocr_server_url"] = ""
+                warn("No server URL set - add 'oneocr_server_url' to config.json after setting up the server")
 
         # Gemini API key if using gemini_api OCR
         if cfg["ocr_method"] == "gemini_api":
@@ -881,6 +981,9 @@ def show_vram_estimate(cfg: dict):
         components.append(f"Gemini API: {model} (cloud, no VRAM)")
     elif ocr == "oneocr":
         components.append("OneOCR (no VRAM)")
+    elif ocr == "oneocr_remote":
+        server_url = cfg.get("oneocr_server_url", "not set")
+        components.append(f"OneOCR Remote: {server_url} (network, no VRAM)")
 
     if translate == "hunyuan_mt":
         translate_vram = 1.1
@@ -928,7 +1031,8 @@ def show_summary(cfg: dict):
         "lfm_vlm": "LFM 2.5 VL",
         "ministral_vlm_q8": "Ministral 3B Q8",
         "gemini_api": "Gemini API",
-        "oneocr": "OneOCR"
+        "oneocr": "OneOCR",
+        "oneocr_remote": "OneOCR Remote"
     }
     translate_names = {
         "qwen_vlm": "Qwen 3 VL",
@@ -945,6 +1049,9 @@ def show_summary(cfg: dict):
     table.add_row("OCR", f"[bold]{ocr_display}[/]")
     if ocr == "gemini_api":
         table.add_row("  API Key", "[green]Set[/]" if cfg.get("gemini_api_key") else "[yellow]Not set[/]")
+    elif ocr == "oneocr_remote":
+        server_url = cfg.get("oneocr_server_url", "")
+        table.add_row("  Server URL", f"[green]{server_url}[/]" if server_url else "[yellow]Not set[/]")
 
     # Translation row
     translate_display = translate_names.get(translate, translate)

@@ -347,12 +347,29 @@ def setup_windows_ocr():
     try:
         import ctypes
         if not ctypes.windll.shell32.IsUserAnAdmin():
-            warn("Admin required - relaunching...")
+            console.print(Panel(
+                "[bold yellow]Administrator Access Required[/]\n\n"
+                "OneOCR needs to copy files from Windows Snipping Tool.\n"
+                "This requires one-time Administrator privileges.\n\n"
+                "[dim]A Windows UAC prompt will appear - click 'Yes' to continue.\n"
+                "If you click 'No', setup will continue without OneOCR and\n"
+                "you'll need to use Local VLM or API options instead (10x slower).[/]",
+                title="[bold cyan]OneOCR Setup[/]",
+                border_style="yellow"
+            ))
+            info("Requesting Administrator privileges...")
             script = os.path.abspath(sys.argv[0])
             args = ' '.join(f'"{a}"' for a in sys.argv[1:])
-            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{script}" {args}', None, 1)
-            sys.exit(0)
-    except: pass
+            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{script}" {args}', None, 1)
+            if result > 32:  # Success - elevated process started
+                sys.exit(0)
+            else:
+                warn("Admin access declined - skipping OneOCR setup")
+                console.print("[dim]You can use Local VLM or API options for OCR instead.[/]")
+                return False
+    except Exception as e:
+        warn(f"Could not request admin: {e}")
+        return False
 
     base = "C:\\Program Files\\WindowsApps"
     src = None
