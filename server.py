@@ -627,21 +627,26 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
 
     def do_ocr_l1():
         """OCR for L1 (text bubbles)."""
+        from workflow.ocr import _get_configured_ocr_method
         t0 = time.time()
+        ocr_method, is_api, is_remote = _get_configured_ocr_method()
+
         if ocr_translate and HAS_VLM_OCR:
             print(f"  [OCR L1] Using VLM for combined OCR and translation...")
             result, pos, grid = run_ocr_on_bubbles(bubbles, translate=True)
             mode = "ocr_translate"
         elif HAS_VLM_OCR:
-            print(f"  [OCR L1] Using VLM for OCR ({len(bubbles)} bubbles)...")
+            # Show actual OCR method being used
+            method_name = ocr_method.replace("_", " ").title() if ocr_method else "VLM"
+            print(f"  [OCR L1] Using {method_name} for OCR ({len(bubbles)} bubbles)...")
             result, pos, grid = run_ocr_on_bubbles(bubbles, translate=False)
-            mode = "vlm"
+            mode = ocr_method or "vlm"
         else:
-            grid, pos = grid_bubbles(bubbles)
+            grid, pos, _ = grid_bubbles(bubbles)
             result = run_ocr(grid)
             mode = "http"
         elapsed = int((time.time() - t0) * 1000)
-        print(f"  [OCR L1] {result.get('line_count', 0)} lines in {elapsed}ms")
+        print(f"  [OCR L1] {result.get('line_count', 0)} lines in {elapsed}ms (method: {mode})")
         return result, pos, grid, elapsed, mode
 
     def do_ocr_l2():
@@ -653,7 +658,7 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
             print(f"  [OCR L2] Using VLM for {len(bubbles_l2)} text-free regions...")
             result, pos, _ = run_ocr_on_bubbles(bubbles_l2, translate=False)
         else:
-            l2_grid, pos = grid_bubbles(bubbles_l2)
+            l2_grid, pos, _ = grid_bubbles(bubbles_l2)
             result = run_ocr(l2_grid)
         elapsed = int((time.time() - t0) * 1000)
         print(f"  [OCR L2] {result.get('line_count', 0)} lines in {elapsed}ms")
@@ -688,23 +693,26 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
             return page_masks, elapsed_ms
         text_seg_future = _parallel_executor.submit(do_text_segmentation_on_pages)
 
-    # Map OCR to bubbles
-    bubble_texts = map_ocr(ocr_result, positions)
+    # Map OCR to bubbles (verbose=True to debug mapping issues)
+    bubble_texts = map_ocr(ocr_result, positions, verbose=True)
 
-    # DEBUG: Log OCR mapping details
-    print(f"  [DEBUG OCR Mapping]")
-    print(f"    OCR lines ({len(ocr_result.get('lines', []))} total):")
-    for i, line in enumerate(ocr_result.get('lines', [])):
-        cell_idx = line.get('cell_idx', '?')
-        text = line.get('text', '')[:25].replace('\n', '\\n')
-        print(f"      line[{i}]: cell_idx={cell_idx}, text='{text}'")
+    # DEBUG: Show mapping summary
+    all_keys = set(pos['key'] for pos in positions)
+    mapped_keys = set(bubble_texts.keys())
+    unmapped_keys = all_keys - mapped_keys
 
-    print(f"    Positions ({len(positions) if positions else 0} total):")
-    if positions:
-        for i, pos in enumerate(positions):
-            key = pos.get('key', '?')
-            bbox = pos.get('bubble_box', [])
-            print(f"      pos[{i}]: key={key}, bubble_box={bbox}")
+    print(f"  [DEBUG OCR Mapping Summary]")
+    print(f"    OCR lines: {len(ocr_result.get('lines', []))}")
+    print(f"    Total bubbles: {len(all_keys)}")
+    print(f"    Mapped: {len(mapped_keys)} ({100*len(mapped_keys)/max(1,len(all_keys)):.1f}%)")
+    print(f"    Unmapped: {len(unmapped_keys)}")
+
+    if unmapped_keys and len(unmapped_keys) <= 20:
+        print(f"    Unmapped bubble positions:")
+        for key in sorted(unmapped_keys):
+            pos = next(p for p in positions if p['key'] == key)
+            gbox = pos['grid_box']
+            print(f"      {key}: grid_box=({gbox[0]}, {gbox[1]}, {gbox[2]}, {gbox[3]})")
 
     print(f"    Mapped bubble_texts:")
     for key, text_items in sorted(bubble_texts.items()):
@@ -1103,7 +1111,7 @@ def process_images_label2(images: List[Image.Image], api_key: str = None, output
         stats["sequential_mode"] = True
 
     # Grid and OCR for label 1 (text bubbles)
-    grid, positions = grid_bubbles(bubbles_l1)
+    grid, positions, _ = grid_bubbles(bubbles_l1)
     ocr_result = run_ocr(grid)
     bubble_texts = map_ocr(ocr_result, positions)
 

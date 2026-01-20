@@ -31,6 +31,17 @@ if platform.system() != 'Windows':
     print("This machine is running:", platform.system())
     sys.exit(1)
 
+# Set DPI awareness to avoid coordinate scaling issues
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    print("[DPI] Set per-monitor DPI awareness")
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()  # Fallback for older Windows
+        print("[DPI] Set process DPI aware (fallback)")
+    except Exception:
+        print("[DPI] Warning: Could not set DPI awareness")
+
 # Flask for HTTP server
 try:
     from flask import Flask, request, jsonify
@@ -123,71 +134,225 @@ def setup_oneocr():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OneOCR Engine
+# OneOCR Engine (embedded, no external dependencies)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ocr_engine = None
+import struct
+import time
+
+MODEL_KEY = b'kj)TGtrK>f]b[Piow.gU+nC@s""""""4'
 
 
-def get_ocr_engine():
-    """Get or create OneOCR engine instance."""
-    global _ocr_engine
-
-    if _ocr_engine is not None:
-        return _ocr_engine
-
-    # Add OCR directory to DLL search path
-    os.add_dll_directory(OCR_DIR)
-
-    # Import and initialize OneOCR
-    try:
-        # Try to import the oneocr module
-        sys.path.insert(0, SCRIPT_DIR)
-        from oneocr_wrapper import OneOCR
-        _ocr_engine = OneOCR(OCR_DIR)
-        print("[OK] OneOCR engine initialized")
-        return _ocr_engine
-    except Exception as e:
-        print(f"ERROR: Failed to initialize OneOCR: {e}")
-        raise
+class OcrImage(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int32),
+        ("col", ctypes.c_int32),
+        ("row", ctypes.c_int32),
+        ("_unk", ctypes.c_int32),
+        ("step", ctypes.c_int64),
+        ("data_ptr", ctypes.c_int64)
+    ]
 
 
-class OneOCREngine:
-    """Simple OneOCR wrapper using ctypes."""
+class BBox(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_float),
+        ("y", ctypes.c_float),
+        ("width", ctypes.c_float),
+        ("height", ctypes.c_float)
+    ]
 
-    def __init__(self, ocr_dir):
+
+def _check_dll_arch(dll_path):
+    """Check if DLL matches Python architecture."""
+    py_bits = struct.calcsize('P') * 8
+    with open(dll_path, 'rb') as f:
+        f.seek(0x3C)
+        f.seek(struct.unpack('<I', f.read(4))[0] + 4)
+        machine = struct.unpack('<H', f.read(2))[0]
+    dll_bits = {0x14c: 32, 0x8664: 64, 0xaa64: 64}.get(machine, 0)
+    return py_bits == dll_bits
+
+
+class OneOCR:
+    """Embedded OneOCR wrapper - no external dependencies."""
+
+    def __init__(self, ocr_dir, max_lines=1000):
         self.ocr_dir = ocr_dir
-        os.add_dll_directory(ocr_dir)
-
-        # Load the DLL
-        dll_path = os.path.join(ocr_dir, 'oneocr.dll')
-        self.dll = ctypes.CDLL(dll_path)
+        self.dll_path = os.path.join(ocr_dir, 'oneocr.dll')
+        self.model_path = None
 
         # Find model file
-        self.model_path = None
         for f in os.listdir(ocr_dir):
             if f.endswith('.onemodel'):
                 self.model_path = os.path.join(ocr_dir, f)
                 break
 
+        if not os.path.exists(self.dll_path):
+            raise FileNotFoundError(f"DLL not found: {self.dll_path}")
         if not self.model_path:
-            raise FileNotFoundError("No .onemodel file found")
+            raise FileNotFoundError(f"No .onemodel file found in {ocr_dir}")
+        if not _check_dll_arch(self.dll_path):
+            raise RuntimeError("DLL/Python architecture mismatch (need 64-bit Python for 64-bit DLL)")
 
-        self._initialized = False
+        # Load DLL
+        os.add_dll_directory(ocr_dir)
+        self._dll = ctypes.WinDLL(self.dll_path)
+        self._setup_dll()
+        self._init(max_lines)
+        print(f"[OK] OneOCR initialized: {self.dll_path}")
 
-    def recognize(self, image):
-        """
-        Recognize text in image.
+    def _setup_dll(self):
+        d = self._dll
+        i64 = ctypes.c_int64
+        pi64 = ctypes.POINTER(ctypes.c_int64)
+
+        d.CreateOcrInitOptions.argtypes = [pi64]
+        d.CreateOcrInitOptions.restype = i64
+        d.OcrInitOptionsSetUseModelDelayLoad.argtypes = [i64, ctypes.c_char]
+        d.OcrInitOptionsSetUseModelDelayLoad.restype = i64
+        d.CreateOcrPipeline.argtypes = [ctypes.c_char_p, ctypes.c_char_p, i64, pi64]
+        d.CreateOcrPipeline.restype = i64
+        d.CreateOcrProcessOptions.argtypes = [pi64]
+        d.CreateOcrProcessOptions.restype = i64
+        d.OcrProcessOptionsSetMaxRecognitionLineCount.argtypes = [i64, i64]
+        d.OcrProcessOptionsSetMaxRecognitionLineCount.restype = i64
+        d.RunOcrPipeline.argtypes = [i64, ctypes.POINTER(OcrImage), i64, pi64]
+        d.RunOcrPipeline.restype = i64
+        d.GetOcrLineCount.argtypes = [i64, pi64]
+        d.GetOcrLineCount.restype = i64
+        d.GetOcrLine.argtypes = [i64, i64, pi64]
+        d.GetOcrLine.restype = i64
+        d.GetOcrLineContent.argtypes = [i64, pi64]
+        d.GetOcrLineContent.restype = i64
+        d.GetOcrLineBoundingBox.argtypes = [i64, pi64]
+        d.GetOcrLineBoundingBox.restype = i64
+
+    def _init(self, max_lines):
+        self._ctx = ctypes.c_int64()
+        self._pipeline = ctypes.c_int64()
+        self._opt = ctypes.c_int64()
+
+        self._dll.CreateOcrInitOptions(ctypes.byref(self._ctx))
+        self._dll.OcrInitOptionsSetUseModelDelayLoad(self._ctx.value, ctypes.c_char(0))
+        self._dll.CreateOcrPipeline(
+            self.model_path.encode(),
+            MODEL_KEY,
+            self._ctx.value,
+            ctypes.byref(self._pipeline)
+        )
+        self._dll.CreateOcrProcessOptions(ctypes.byref(self._opt))
+        self._dll.OcrProcessOptionsSetMaxRecognitionLineCount(self._opt.value, max_lines)
+
+    def _prepare_image(self, image_path):
+        """Prepare image for OCR."""
+        pil = Image.open(image_path)
+        if pil.mode != 'RGBA':
+            pil = pil.convert('RGBA')
+
+        # Convert RGB to BGR for Windows OCR
+        r, g, b, a = pil.split()
+        bgra = Image.merge('RGBA', (b, g, r, a))
+
+        # Create buffer
+        buf = ctypes.create_string_buffer(bgra.tobytes())
+        ocr_img = OcrImage(3, bgra.width, bgra.height, 0, bgra.width * 4, ctypes.addressof(buf))
+        return ocr_img, buf
+
+    def recognize(self, image_path):
+        """Run OCR on image file.
 
         Args:
-            image: PIL Image or path to image file
+            image_path: Path to image file
 
         Returns:
-            List of dicts with 'text', 'confidence', 'bbox'
+            List of dicts with 'text', 'bbox', 'confidence'
         """
-        # This is a placeholder - actual implementation depends on OneOCR API
-        # The real implementation would call the DLL functions
-        raise NotImplementedError("Use oneocr_wrapper.py for actual OCR")
+        t0 = time.time()
+        ocr_img, data = self._prepare_image(image_path)
+
+        result = ctypes.c_int64()
+        self._dll.RunOcrPipeline(
+            self._pipeline.value,
+            ctypes.byref(ocr_img),
+            self._opt.value,
+            ctypes.byref(result)
+        )
+
+        count = ctypes.c_int64()
+        self._dll.GetOcrLineCount(result.value, ctypes.byref(count))
+
+        lines = []
+        for i in range(count.value):
+            line = ctypes.c_int64()
+            if self._dll.GetOcrLine(result.value, i, ctypes.byref(line)) != 0:
+                continue
+
+            # Get text
+            txt_ptr = ctypes.c_int64()
+            self._dll.GetOcrLineContent(line.value, ctypes.byref(txt_ptr))
+            try:
+                text = ctypes.cast(txt_ptr.value, ctypes.c_char_p).value.decode('utf-8')
+            except:
+                continue
+
+            # Get bounding box
+            box_ptr = ctypes.c_int64()
+            self._dll.GetOcrLineBoundingBox(line.value, ctypes.byref(box_ptr))
+            if box_ptr.value:
+                b = ctypes.cast(box_ptr.value, ctypes.POINTER(BBox)).contents
+                bbox = [b.x, b.y, b.x + b.width, b.y + b.height]
+            else:
+                bbox = [0, 0, 0, 0]
+
+            lines.append({
+                'text': text,
+                'bbox': bbox,
+                'confidence': 1.0
+            })
+
+        elapsed = (time.time() - t0) * 1000
+        print(f"[OCR] Recognized {len(lines)} lines in {elapsed:.0f}ms")
+
+        # Debug: Check for out-of-bounds coordinates
+        pil = Image.open(image_path)
+        img_w, img_h = pil.size
+        out_of_bounds = [l for l in lines if l['bbox'][2] > img_w or l['bbox'][3] > img_h]
+        if out_of_bounds:
+            print(f"[OCR] WARNING: {len(out_of_bounds)} lines have bbox outside image ({img_w}x{img_h}):")
+            for l in out_of_bounds[:5]:
+                print(f"  text='{l['text'][:20]}' bbox={l['bbox']}")
+        return lines
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OneOCR Instance
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ocr_engine = None
+
+
+def _get_ocr_engine():
+    """Get or create OneOCR engine instance."""
+    global _ocr_engine
+    if _ocr_engine is not None:
+        return _ocr_engine
+
+    _ocr_engine = OneOCR(OCR_DIR)
+    return _ocr_engine
+
+
+def _run_oneocr(image_path: str) -> list:
+    """Run OneOCR on an image file.
+
+    Args:
+        image_path: Path to image file
+
+    Returns:
+        List of dicts with 'text', 'confidence', 'bbox'
+    """
+    ocr = _get_ocr_engine()
+    return ocr.recognize(image_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -220,60 +385,81 @@ def ocr():
     Returns:
         JSON with OCR results
     """
+    import traceback
+
     try:
         image = None
+        print(f"[OCR] Received request, content_type={request.content_type}")
 
         # Handle JSON request with base64 image
         if request.is_json:
             data = request.get_json()
             if 'image' in data:
+                print(f"[OCR] Decoding base64 image ({len(data['image'])} chars)")
                 image_data = base64.b64decode(data['image'])
                 image = Image.open(BytesIO(image_data))
+                print(f"[OCR] Image loaded: {image.size}, mode={image.mode}")
 
         # Handle form data with file upload
         elif 'image' in request.files:
+            print("[OCR] Loading from form file upload")
             image = Image.open(request.files['image'])
 
         # Handle raw image data
         elif request.data:
+            print(f"[OCR] Loading from raw data ({len(request.data)} bytes)")
             image = Image.open(BytesIO(request.data))
 
         if image is None:
+            print("[OCR] ERROR: No image provided in request")
             return jsonify({'error': 'No image provided'}), 400
 
         # Convert to RGB if needed
         if image.mode != 'RGB':
+            print(f"[OCR] Converting from {image.mode} to RGB")
             image = image.convert('RGB')
 
-        # Run OCR using the workflow module
+        # Run OCR using local OneOCR wrapper (no external deps needed)
         try:
-            # Import the actual OneOCR implementation from workflow
-            sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
-            from workflow.ocr_oneocr import recognize_text
-
-            # Save temp image for OCR
             import tempfile
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                image.save(tmp.name)
-                results = recognize_text(tmp.name, ocr_dir=OCR_DIR)
-                os.unlink(tmp.name)
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                    tmp_path = tmp.name
+                    image.save(tmp_path)
+                print(f"[OCR] Saved temp image: {tmp_path}")
+                print(f"[OCR] Running OneOCR...")
+                results = _run_oneocr(tmp_path)
+                print(f"[OCR] Got {len(results) if results else 0} results")
+            finally:
+                # Clean up temp file (ignore errors - Windows may hold the file)
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except:
+                        pass  # File will be cleaned up by OS later
 
             return jsonify({
                 'success': True,
                 'results': results
             })
 
-        except ImportError:
-            # Fallback: use simple OCR wrapper
+        except Exception as e:
+            print(f"[OCR] ERROR during OCR: {type(e).__name__}: {e}")
+            print(f"[OCR] Traceback:\n{traceback.format_exc()}")
             return jsonify({
-                'error': 'OneOCR wrapper not available',
-                'hint': 'Ensure oneocr_wrapper.py is present'
+                'error': str(e),
+                'type': type(e).__name__,
+                'traceback': traceback.format_exc()
             }), 500
 
     except Exception as e:
+        print(f"[OCR] ERROR in request handling: {type(e).__name__}: {e}")
+        print(f"[OCR] Traceback:\n{traceback.format_exc()}")
         return jsonify({
             'error': str(e),
-            'type': type(e).__name__
+            'type': type(e).__name__,
+            'traceback': traceback.format_exc()
         }), 500
 
 
@@ -300,7 +486,10 @@ def ocr_batch():
 
         results = []
 
+        import tempfile
+
         for i, img_b64 in enumerate(images):
+            tmp_path = None
             try:
                 image_data = base64.b64decode(img_b64)
                 image = Image.open(BytesIO(image_data))
@@ -308,15 +497,11 @@ def ocr_batch():
                 if image.mode != 'RGB':
                     image = image.convert('RGB')
 
-                # Import OCR module
-                sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
-                from workflow.ocr_oneocr import recognize_text
-
-                import tempfile
+                # Use local OCR wrapper (no external deps)
                 with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                    image.save(tmp.name)
-                    ocr_result = recognize_text(tmp.name, ocr_dir=OCR_DIR)
-                    os.unlink(tmp.name)
+                    tmp_path = tmp.name
+                    image.save(tmp_path)
+                ocr_result = _run_oneocr(tmp_path)
 
                 results.append({
                     'index': i,
@@ -330,6 +515,13 @@ def ocr_batch():
                     'success': False,
                     'error': str(e)
                 })
+            finally:
+                # Clean up temp file (ignore errors)
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except:
+                        pass
 
         return jsonify({
             'success': True,

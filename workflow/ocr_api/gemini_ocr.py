@@ -431,8 +431,8 @@ class GeminiOCR:
                     model=current_model,
                     contents=content,
                     config={
-                        "temperature": 0.3 + (attempt * 0.05),  # Increase temp on retry
-                        "max_output_tokens": 4096,
+                        "temperature": 0.2,  # Low temp for accurate OCR
+                        "max_output_tokens": 8192,
                     }
                 )
 
@@ -510,28 +510,47 @@ class GeminiOCR:
                 if hasattr(e, 'message'):
                     print(f"[Gemini OCR] Message: {e.message}")
 
-                # Check for rate limit error (429) and switch to fallback model
+                # Check error types
+                is_503_overloaded = ('503' in error_str or 'unavailable' in error_str or 'overloaded' in error_str)
                 is_rate_limited = ('429' in error_str or 'resource_exhausted' in error_str or
-                                   'quota' in error_str or 'rate' in error_str)
-                if is_rate_limited and current_model in FALLBACK_MODELS:
+                                   'quota' in error_str)
+
+                # Track 503 errors for this model to know when to switch
+                if not hasattr(self, '_503_count'):
+                    self._503_count = {}
+                if current_model not in self._503_count:
+                    self._503_count[current_model] = 0
+
+                if is_503_overloaded:
+                    self._503_count[current_model] += 1
+                    if self._503_count[current_model] >= 2 and current_model in FALLBACK_MODELS:
+                        # Second 503 error - switch to fallback model
+                        fallback = FALLBACK_MODELS[current_model]
+                        print(f"[Gemini OCR] Model {current_model} overloaded (503 x{self._503_count[current_model]}), switching to: {fallback}")
+                        current_model = fallback
+                        self._503_count[current_model] = 0  # Reset count for new model
+                    else:
+                        # First 503 - just wait and retry same model
+                        print(f"[Gemini OCR] Model overloaded (503), waiting 2-3s before retry...")
+                    if attempt < max_retries:
+                        time.sleep(random.uniform(2, 3))
+                elif is_rate_limited and current_model in FALLBACK_MODELS:
+                    # Rate limit (429) - switch immediately
                     fallback = FALLBACK_MODELS[current_model]
                     print(f"[Gemini OCR] Rate limited on {current_model}, switching to fallback: {fallback}")
                     current_model = fallback
-
-                if attempt < max_retries:
-                    # Exponential backoff for rate limiting
-                    wait_time = 1 * (attempt + 1)
-                    if is_rate_limited:
-                        wait_time = max(wait_time, 2)  # At least 2s for rate limits
-                    time.sleep(wait_time)
+                    if attempt < max_retries:
+                        time.sleep(2)
+                elif attempt < max_retries:
+                    # Other errors - basic backoff
+                    time.sleep(1 * (attempt + 1))
 
         print(f"[Gemini OCR] All retries failed. Last error: {last_error}")
         return {'lines': [], 'line_count': 0, 'processing_time_ms': (time.time() - t0) * 1000,
                 'translated': translate, 'error': last_error}
 
     def run_grid(self, bubbles: List[Dict], row_width: int = 1600,
-                 padding: int = 10, translate: bool = False,
-                 max_missing_retries: int = 2) -> Tuple[Dict, List[Dict], Image.Image]:
+                 padding: int = 10, translate: bool = False) -> Tuple[Dict, List[Dict], Image.Image]:
         """Create grid and run OCR in one call (matches VlmOCR.run_grid).
 
         Args:
@@ -539,7 +558,6 @@ class GeminiOCR:
             row_width: Max width for grid rows
             padding: Padding between cells
             translate: If True, translate to target language
-            max_missing_retries: Max retries for missing cells only
 
         Returns:
             Tuple of (ocr_result, positions, grid_image)
@@ -557,15 +575,13 @@ class GeminiOCR:
         # Run OCR on grid
         ocr_result = self.run(grid_img, positions, grid_info, translate=translate)
 
-        # Check for missing cells and retry only those
+        # Check for missing cells and retry only those (single retry)
         expected_cells = len(bubbles)
         parsed_cells = {line['cell_idx'] for line in ocr_result.get('lines', [])}
         missing_indices = set(range(expected_cells)) - parsed_cells
 
-        retry_count = 0
-        while missing_indices and retry_count < max_missing_retries:
-            retry_count += 1
-            print(f"[Gemini OCR] Retrying {len(missing_indices)} missing cells (attempt {retry_count}/{max_missing_retries})")
+        if missing_indices:
+            print(f"[Gemini OCR] Retrying {len(missing_indices)} missing cells")
 
             # Collect bubble images for missing cells
             missing_bubbles = [bubbles[i] for i in sorted(missing_indices)]
@@ -589,11 +605,10 @@ class GeminiOCR:
                     ocr_result['lines'].append(line)
                     parsed_cells.add(original_idx)
 
-            # Update missing indices
-            missing_indices = set(range(expected_cells)) - parsed_cells
-
-            if missing_indices:
-                print(f"[Gemini OCR] Still missing {len(missing_indices)} cells after retry {retry_count}")
+            # Check what's still missing
+            still_missing = set(range(expected_cells)) - parsed_cells
+            if still_missing:
+                print(f"[Gemini OCR] Still missing {len(still_missing)} cells: {sorted(still_missing)}")
 
         # Update line count
         ocr_result['line_count'] = len(ocr_result.get('lines', []))

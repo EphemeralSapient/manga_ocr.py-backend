@@ -42,98 +42,123 @@ SYSTEM_PROMPT = """You are a Japanese to English translator for manga. Translate
 def translate_batch(
     client: Cerebras,
     batch_idx: int,
-    batch: List[str]
+    batch: List[str],
+    max_retries: int = 3
 ) -> Tuple[int, List[str], Dict]:
-    """Translate a single batch of texts."""
+    """Translate a single batch of texts with retry logic."""
     batch_start = time.time()
     batch_info = {"batch_idx": batch_idx, "count": len(batch), "status": "success"}
 
-    try:
-        numbered = [f"{i+1}. {t}" for i, t in enumerate(batch)]
-        # Log what we're sending
-        input_preview = json.dumps(numbered[:5], ensure_ascii=False)
-        if len(numbered) > 5:
-            input_preview = input_preview[:-1] + f', ... +{len(numbered)-5} more]'
-        print(f"    [Translate] Batch {batch_idx} sending {len(batch)} texts: {input_preview[:300]}")
+    numbered = [f"{i+1}. {t}" for i, t in enumerate(batch)]
+    # Log what we're sending
+    input_preview = json.dumps(numbered[:5], ensure_ascii=False)
+    if len(numbered) > 5:
+        input_preview = input_preview[:-1] + f', ... +{len(numbered)-5} more]'
+    print(f"    [Translate] Batch {batch_idx} sending {len(batch)} texts: {input_preview[:300]}")
 
-        completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": f"Translate these {len(batch)} Japanese texts to English:\n{json.dumps(numbered, ensure_ascii=False)}"
-                }
-            ],
-            model=MODEL,
-            stream=False,
-            max_completion_tokens=8192,
-            temperature=1,
-            top_p=1,
-            reasoning_effort="low",
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "translation_schema",
-                    "strict": True,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "input_text": {"type": "array", "items": {"type": "string"}},
-                            "translated": {"type": "array", "items": {"type": "string"}}
-                        },
-                        "required": ["input_text", "translated"],
-                        "additionalProperties": False
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                # Wait before retry (exponential backoff)
+                wait_time = 2 ** attempt
+                print(f"    [Translate] Batch {batch_idx} retry {attempt + 1}/{max_retries} after {wait_time}s...")
+                time.sleep(wait_time)
+
+            completion = client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": f"Translate these {len(batch)} Japanese texts to English:\n{json.dumps(numbered, ensure_ascii=False)}"
+                    }
+                ],
+                model=MODEL,
+                stream=False,
+                max_completion_tokens=8192,
+                temperature=1,
+                top_p=1,
+                reasoning_effort="low",
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "translation_schema",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "input_text": {"type": "array", "items": {"type": "string"}},
+                                "translated": {"type": "array", "items": {"type": "string"}}
+                            },
+                            "required": ["input_text", "translated"],
+                            "additionalProperties": False
+                        }
                     }
                 }
-            }
-        )
-        content = completion.choices[0].message.content
-        batch_info["time_ms"] = int((time.time() - batch_start) * 1000)
-        batch_info["finish_reason"] = completion.choices[0].finish_reason
+            )
+            content = completion.choices[0].message.content
+            batch_info["time_ms"] = int((time.time() - batch_start) * 1000)
+            batch_info["finish_reason"] = completion.choices[0].finish_reason
 
-        if content:
-            # Log raw response
-            print(f"    [Translate] Batch {batch_idx} response ({len(content)} chars): {content[:300]}{'...' if len(content) > 300 else ''}")
+            if content:
+                # Log raw response
+                print(f"    [Translate] Batch {batch_idx} response ({len(content)} chars): {content[:300]}{'...' if len(content) > 300 else ''}")
 
-            result = json.loads(content)
-            translations = result.get("translated", [])
+                result = json.loads(content)
+                translations = result.get("translated", [])
 
-            # Log translation breakdown
-            no_text = sum(1 for t in translations if t == "[NO TEXT]")
-            empty = sum(1 for t in translations if not t)
-            actual = len(translations) - no_text - empty
-            print(f"    [Translate] Batch {batch_idx} parsed: {actual} translations, {no_text} [NO TEXT], {empty} empty")
+                # Log translation breakdown
+                no_text = sum(1 for t in translations if t == "[NO TEXT]")
+                empty = sum(1 for t in translations if not t)
+                actual = len(translations) - no_text - empty
+                print(f"    [Translate] Batch {batch_idx} parsed: {actual} translations, {no_text} [NO TEXT], {empty} empty")
 
-            # Pad if needed
-            if len(translations) < len(batch):
-                batch_info["status"] = f"partial ({len(translations)}/{len(batch)})"
-                print(f"    [Translate] Batch {batch_idx} WARNING: got {len(translations)} translations for {len(batch)} inputs")
-            while len(translations) < len(batch):
-                translations.append("[TRANSLATION FAILED]")
-            return batch_idx, translations[:len(batch)], batch_info
-        else:
-            batch_info["status"] = "empty_response"
-            print(f"    [Translate] Batch {batch_idx} empty response, finish_reason: {batch_info['finish_reason']}")
+                # Pad if needed
+                if len(translations) < len(batch):
+                    batch_info["status"] = f"partial ({len(translations)}/{len(batch)})"
+                    print(f"    [Translate] Batch {batch_idx} WARNING: got {len(translations)} translations for {len(batch)} inputs")
+                while len(translations) < len(batch):
+                    translations.append("[TRANSLATION FAILED]")
+                return batch_idx, translations[:len(batch)], batch_info
+            else:
+                batch_info["status"] = "empty_response"
+                print(f"    [Translate] Batch {batch_idx} empty response, finish_reason: {batch_info['finish_reason']}")
 
-    except Exception as e:
-        batch_info["time_ms"] = int((time.time() - batch_start) * 1000)
-        batch_info["status"] = f"error: {type(e).__name__}"
-        batch_info["error"] = str(e)
+        except Exception as e:
+            last_error = e
+            batch_info["time_ms"] = int((time.time() - batch_start) * 1000)
+            batch_info["status"] = f"error: {type(e).__name__}"
+            batch_info["error"] = str(e)
 
-        # Print detailed error info
-        print(f"    [Translate] Batch {batch_idx} error: {type(e).__name__}: {e}")
-        if hasattr(e, 'response'):
-            print(f"    [Translate] Response: {e.response}")
-        if hasattr(e, 'status_code'):
-            print(f"    [Translate] Status code: {e.status_code}")
-        if hasattr(e, 'body'):
-            print(f"    [Translate] Body: {e.body}")
-        if hasattr(e, 'message'):
-            print(f"    [Translate] Message: {e.message}")
-        # For connection errors, show more details
-        if hasattr(e, '__cause__') and e.__cause__:
-            print(f"    [Translate] Cause: {type(e.__cause__).__name__}: {e.__cause__}")
+            # Print detailed error info
+            print(f"    [Translate] Batch {batch_idx} error: {type(e).__name__}: {e}")
+            if hasattr(e, 'response'):
+                print(f"    [Translate] Response: {e.response}")
+            if hasattr(e, 'status_code'):
+                print(f"    [Translate] Status code: {e.status_code}")
+            if hasattr(e, 'body'):
+                print(f"    [Translate] Body: {e.body}")
+            if hasattr(e, 'message'):
+                print(f"    [Translate] Message: {e.message}")
+            # For connection errors, show more details
+            if hasattr(e, '__cause__') and e.__cause__:
+                print(f"    [Translate] Cause: {type(e).__name__}: {e.__cause__}")
 
+            # Check if we should retry (rate limit or server error)
+            is_retryable = (
+                'RateLimitError' in type(e).__name__ or
+                '429' in str(e) or
+                '503' in str(e) or
+                '502' in str(e) or
+                'timeout' in str(e).lower()
+            )
+            if is_retryable and attempt < max_retries - 1:
+                continue  # Retry
+            else:
+                break  # Give up
+
+    # All retries exhausted
+    batch_info["retries"] = attempt + 1 if last_error else 0
     return batch_idx, ["[TRANSLATION FAILED]"] * len(batch), batch_info
 
 

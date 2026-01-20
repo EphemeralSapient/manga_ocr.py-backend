@@ -456,6 +456,64 @@ def get_oneocr_server_url() -> str:
     """Get OneOCR remote server URL."""
     return get("oneocr_server_url", "")
 
+
+def verify_oneocr_server(url: str = None, timeout: float = 5.0) -> tuple:
+    """Verify OneOCR server is reachable and healthy.
+
+    Args:
+        url: Server URL (uses config if not provided)
+        timeout: Request timeout in seconds
+
+    Returns:
+        (success: bool, message: str, details: dict or None)
+    """
+    import requests
+
+    if url is None:
+        url = get_oneocr_server_url()
+
+    if not url:
+        return False, "No OneOCR server URL configured", None
+
+    health_url = url.rstrip('/') + '/health'
+
+    try:
+        response = requests.get(health_url, timeout=timeout)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('status') == 'ok':
+                return True, f"Server OK: {data.get('service', 'oneocr')} v{data.get('version', '?')}", data
+            else:
+                return False, f"Server returned unhealthy status: {data}", data
+        else:
+            return False, f"Server returned HTTP {response.status_code}", None
+    except requests.exceptions.ConnectionError as e:
+        return False, f"Cannot connect to {url}: Connection refused", None
+    except requests.exceptions.Timeout:
+        return False, f"Cannot connect to {url}: Timeout after {timeout}s", None
+    except Exception as e:
+        return False, f"Error checking {url}: {type(e).__name__}: {e}", None
+
+
+def require_oneocr_server() -> str:
+    """Get OneOCR server URL and verify it's working. Raises error if not.
+
+    Returns:
+        Server URL if healthy
+
+    Raises:
+        RuntimeError if server is not reachable or unhealthy
+    """
+    url = get_oneocr_server_url()
+    if not url:
+        raise RuntimeError("OneOCR server URL not configured. Set 'oneocr_server_url' in config.json")
+
+    success, message, _ = verify_oneocr_server(url)
+    if not success:
+        raise RuntimeError(f"OneOCR server not available: {message}")
+
+    return url
+
 def get_target_language_name() -> str:
     """Get the full name of the target language."""
     lang_code = get_target_language()

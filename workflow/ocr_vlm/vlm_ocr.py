@@ -45,7 +45,7 @@ def check_vlm_available():
     return find_llama() is not None
 
 
-def create_ocr_grid(bubbles, row_width=1600, padding=10):
+def create_ocr_grid(bubbles, row_width=600, padding=30):
     """
     Arrange bubble crops into a grid with colored separators for VLM OCR.
 
@@ -513,13 +513,13 @@ class VlmOCR:
         return {'lines': [], 'line_count': 0, 'processing_time_ms': (time.time() - t0) * 1000,
                 'translated': translate, 'error': last_error}
 
-    def run_grid(self, bubbles, row_width=1600, padding=10, translate=False):
+    def run_grid(self, bubbles, row_width=600, padding=30, translate=False):
         """Create grid and run OCR in one call."""
         grid_img, positions, grid_info = create_ocr_grid(bubbles, row_width, padding)
         ocr_result = self.run(grid_img, positions, grid_info, translate=translate)
         return ocr_result, positions, grid_img
 
-    def run_batched(self, bubbles, row_width=1600, padding=10, translate=False, parallel=False):
+    def run_batched(self, bubbles, row_width=600, padding=30, translate=False, parallel=False):
         """Process bubbles in batches."""
         if len(bubbles) <= self.max_cells_per_batch:
             return self.run_grid(bubbles, row_width, padding, translate)
