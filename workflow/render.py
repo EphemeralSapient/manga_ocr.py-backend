@@ -161,19 +161,53 @@ def render_text_on_image(
         img_h, img_w = img_array.shape[:2]
 
         if full_page_mask is not None:
-            # Extract mask region for this bubble from full-page mask
-            # When using grid-based text_seg, the mask is already properly aligned
-            mask_region = full_page_mask[by1:by2, bx1:bx2]
+            from scipy import ndimage
 
-            # Moderate threshold with limited dilation to avoid affecting bubble edges
-            if np.any(mask_region > 5):
-                from scipy import ndimage
-                # Text pixels with moderate confidence
-                text_mask = mask_region > 5
-                # Light dilation to catch immediate anti-aliasing only
-                final_mask = ndimage.binary_dilation(text_mask, iterations=2)
-                # Apply mask
-                img_array[by1:by2, bx1:bx2][final_mask] = 255
+            # Check if we have precise line-level bboxes (OneOCR) vs cell-level (VLM)
+            # OneOCR: multiple small bboxes per bubble, total area << bubble area
+            # VLM: bbox roughly equals bubble area
+            bubble_area = (bx2 - bx1) * (by2 - by1)
+            text_bbox_area = 0
+            valid_text_bboxes = []
+            for text_item in texts:
+                text_bbox = text_item.get("bbox")
+                if text_bbox and len(text_bbox) == 4:
+                    tx1, ty1, tx2, ty2 = text_bbox
+                    if tx2 > tx1 and ty2 > ty1:
+                        text_bbox_area += (tx2 - tx1) * (ty2 - ty1)
+                        valid_text_bboxes.append(text_bbox)
+
+            # Use line-level masking if text bboxes cover < 70% of bubble area (OneOCR precision)
+            use_line_level = bubble_area > 0 and text_bbox_area < bubble_area * 0.7 and valid_text_bboxes
+
+            if use_line_level:
+                # OneOCR: Use precise line-level bboxes for masking
+                for text_bbox in valid_text_bboxes:
+                    tx1, ty1, tx2, ty2 = text_bbox
+                    # Clamp to image bounds
+                    tx1 = max(0, min(tx1, img_w - 1))
+                    ty1 = max(0, min(ty1, img_h - 1))
+                    tx2 = max(0, min(tx2, img_w))
+                    ty2 = max(0, min(ty2, img_h))
+
+                    if tx2 <= tx1 or ty2 <= ty1:
+                        continue
+
+                    # Extract mask region for this OCR line (NOT the full bubble)
+                    mask_region = full_page_mask[ty1:ty2, tx1:tx2]
+
+                    if np.any(mask_region > 5):
+                        text_mask = mask_region > 5
+                        final_mask = ndimage.binary_dilation(text_mask, iterations=2)
+                        img_array[ty1:ty2, tx1:tx2][final_mask] = 255
+            else:
+                # VLM/other: Use bubble_box for masking (original behavior)
+                mask_region = full_page_mask[by1:by2, bx1:bx2]
+
+                if np.any(mask_region > 5):
+                    text_mask = mask_region > 5
+                    final_mask = ndimage.binary_dilation(text_mask, iterations=2)
+                    img_array[by1:by2, bx1:bx2][final_mask] = 255
 
         elif text_segmenter is not None:
             # Fallback: bbox-based white fill (only if text_segmenter was provided but mask failed)

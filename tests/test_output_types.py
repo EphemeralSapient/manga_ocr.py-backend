@@ -23,7 +23,7 @@ def test_full_page_mode(image_path, server_url="http://localhost:1389"):
     print("Testing FULL_PAGE mode (default)")
     print("="*60)
 
-    url = f"{server_url}/translate/label1"
+    url = f"{server_url}/api/v1/process"
 
     with open(image_path, 'rb') as f:
         files = {'images': ('test.jpg', f, 'image/jpeg')}
@@ -58,7 +58,7 @@ def test_speech_image_only_mode(image_path, server_url="http://localhost:1389"):
     print("Testing SPEECH_IMAGE_ONLY mode")
     print("="*60)
 
-    url = f"{server_url}/translate/label1"
+    url = f"{server_url}/api/v1/process"
 
     with open(image_path, 'rb') as f:
         files = {'images': ('test.jpg', f, 'image/jpeg')}
@@ -102,7 +102,7 @@ def test_text_only_mode(image_path, server_url="http://localhost:1389"):
     print("Testing TEXT_ONLY mode")
     print("="*60)
 
-    url = f"{server_url}/translate/label1"
+    url = f"{server_url}/api/v1/process"
 
     with open(image_path, 'rb') as f:
         files = {'images': ('test.jpg', f, 'image/jpeg')}
@@ -135,16 +135,16 @@ def test_text_only_mode(image_path, server_url="http://localhost:1389"):
         print(response.json())
 
 
-def test_label2_modes(image_path, server_url="http://localhost:1389"):
-    """Test different modes for label2 endpoint (with inpainting)"""
+def test_legacy_modes(image_path, server_url="http://localhost:1389"):
+    """Test different modes for legacy endpoint (with sequential inpainting)"""
     print("\n" + "="*60)
-    print("Testing Label2 endpoint with different output modes")
+    print("Testing legacy endpoint with different output modes")
     print("="*60)
 
-    url = f"{server_url}/translate/label2"
+    url = f"{server_url}/api/v1/process/legacy"
 
     for output_type in ['full_page', 'speech_image_only', 'text_only']:
-        print(f"\n--- Testing {output_type.upper()} mode for label2 ---")
+        print(f"\n--- Testing {output_type.upper()} mode for legacy ---")
 
         with open(image_path, 'rb') as f:
             files = {'images': ('test.jpg', f, 'image/jpeg')}
@@ -201,13 +201,13 @@ def main():
 
     print(f"Testing with image: {image_path}")
 
-    # Test all three modes for label1
+    # Test all three modes for main endpoint
     test_full_page_mode(image_path, server_url)
     test_speech_image_only_mode(image_path, server_url)
     test_text_only_mode(image_path, server_url)
 
-    # Test label2 endpoint with different modes
-    test_label2_modes(image_path, server_url)
+    # Test legacy endpoint with different modes
+    test_legacy_modes(image_path, server_url)
 
     print("\n" + "="*60)
     print("All tests completed!")

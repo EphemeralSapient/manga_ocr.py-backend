@@ -1,6 +1,6 @@
 # Translation Mode Options
 
-The Manga Translation Server supports three translation modes for the `/translate/label1` endpoint.
+The Manga Processing Server supports three translation modes for the `/api/v1/process` endpoint.
 
 ## Translation Modes
 
@@ -102,7 +102,7 @@ python tests/test_client.py
 ```python
 import requests
 
-url = "http://localhost:1389/translate/label1"
+url = "http://localhost:1389/api/v1/process"
 
 with open('manga_page.jpg', 'rb') as f:
     files = {'images': ('page.jpg', f, 'image/jpeg')}
@@ -124,17 +124,17 @@ with open('manga_page.jpg', 'rb') as f:
 
 ```bash
 # Mode 1: VLM OCR+Translate
-curl -X POST http://localhost:1389/translate/label1 \
+curl -X POST http://localhost:1389/api/v1/process \
   -F "images=@manga_page.jpg" \
   -F "ocr_translate=true"
 
 # Mode 2: VLM OCR + Local LLM Translate
-curl -X POST http://localhost:1389/translate/label1 \
+curl -X POST http://localhost:1389/api/v1/process \
   -F "images=@manga_page.jpg" \
   -F "translate_local=true"
 
 # Mode 3: VLM OCR + Cerebras API
-curl -X POST http://localhost:1389/translate/label1 \
+curl -X POST http://localhost:1389/api/v1/process \
   -F "images=@manga_page.jpg" \
   -F "api_key=your-cerebras-key"
 ```

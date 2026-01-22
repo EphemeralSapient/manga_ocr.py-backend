@@ -1,6 +1,6 @@
 # API Output Types Documentation
 
-The Manga Translation Server now supports three different output types for both `/translate/label1` and `/translate/label2` endpoints.
+The Manga Processing Server supports three different output types for the `/api/v1/process` endpoint.
 
 ## Output Types
 
@@ -106,7 +106,7 @@ from PIL import Image
 import io
 
 # Server URL
-url = "http://localhost:1389/translate/label1"
+url = "http://localhost:1389/api/v1/process"
 
 # Read image
 with open('manga_page.jpg', 'rb') as f:
@@ -156,16 +156,16 @@ if result['status'] == 'success':
 
 ```bash
 # Full page (default)
-curl -X POST http://localhost:1389/translate/label1 \
+curl -X POST http://localhost:1389/api/v1/process \
   -F "images=@manga_page.jpg"
 
 # Speech bubbles only
-curl -X POST http://localhost:1389/translate/label1 \
+curl -X POST http://localhost:1389/api/v1/process \
   -F "images=@manga_page.jpg" \
   -F "output_type=speech_image_only"
 
 # Text only
-curl -X POST http://localhost:1389/translate/label1 \
+curl -X POST http://localhost:1389/api/v1/process \
   -F "images=@manga_page.jpg" \
   -F "output_type=text_only"
 ```
@@ -174,13 +174,13 @@ curl -X POST http://localhost:1389/translate/label1 \
 
 | Output Type | Processing Components | Relative Speed | Use Case |
 |------------|----------------------|----------------|-----------|
-| `full_page` | Detect → OCR → Translate → Render Full Page | Baseline | Ready-to-view translated pages |
-| `speech_image_only` | Detect → OCR → Translate → Crop & Render Bubbles | ~90% of baseline | Custom rendering or bubble analysis |
-| `text_only` | Detect → OCR → Translate | ~60% of baseline (fastest) | Data analysis or custom rendering |
+| `full_page` | Detect -> OCR -> Translate -> Render Full Page | Baseline | Ready-to-view translated pages |
+| `speech_image_only` | Detect -> OCR -> Translate -> Crop & Render Bubbles | ~90% of baseline | Custom rendering or bubble analysis |
+| `text_only` | Detect -> OCR -> Translate | ~60% of baseline (fastest) | Data analysis or custom rendering |
 
-## Label2 Endpoint (With Inpainting)
+## Legacy Endpoint
 
-The `/translate/label2` endpoint supports the same output types but includes inpainting:
+The `/api/v1/process/legacy` endpoint supports the same output types but uses sequential inpainting:
 
 - **`full_page`**: Returns inpainted pages with translated text
 - **`speech_image_only`**: Returns bubble images extracted from inpainted pages

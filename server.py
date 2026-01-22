@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Manga Translation Server
-Combines: Detection -> OCR -> Translation -> Inpainting (label2) -> Rendering
+Manga Processing Server
+Full pipeline: Detection -> OCR -> Translation -> Inpainting -> Rendering
 
 Endpoints:
-  POST /translate/label1  - Text bubbles: detect -> OCR -> translate -> render
-  POST /translate/label2  - Text-free regions: detect -> {inpaint, translate} -> render
+  POST /api/v1/process        - Main pipeline: detect -> OCR -> translate -> AOT inpaint -> render
+  POST /api/v1/process/stream - SSE streaming version
+  POST /api/v1/process/legacy - Legacy sequential mode
 
 Request: multipart/form-data with 'images' field (multiple files)
 Response: JSON with base64 encoded output images
@@ -59,6 +60,59 @@ from workflow import render_text_on_image
 from workflow import translate_texts
 from workflow import translate_texts_gemini, HAS_GEMINI_TRANSLATE
 
+
+def merge_ocr_texts_for_translation(texts: list, bubble_box: list = None) -> str:
+    """
+    Merge OCR text items for translation.
+
+    For VLM OCR: returns concatenated text (VLM understands reading order)
+    For OneOCR (multiple line-level bboxes): returns bracketed format [line1,line2,...]
+    to indicate uncertain reading order (let LLM determine correct order from context)
+
+    Detection: OneOCR has multiple texts with small bboxes (< 70% of bubble area)
+    """
+    if not texts:
+        return ""
+
+    text_strings = [t.get('text', '').strip() for t in texts if t.get('text', '').strip()]
+
+    if len(text_strings) == 0:
+        return ""
+    elif len(text_strings) == 1:
+        # Single text - return as-is (both VLM and single-line OneOCR)
+        return text_strings[0]
+    else:
+        # Multiple texts - check if OneOCR (small bboxes) or VLM (cell-level)
+        is_oneocr = False
+
+        if bubble_box and len(bubble_box) == 4:
+            bx1, by1, bx2, by2 = bubble_box
+            bubble_area = (bx2 - bx1) * (by2 - by1)
+
+            # Calculate total text bbox area
+            text_area = 0
+            for t in texts:
+                bbox = t.get('bbox')
+                if bbox and len(bbox) == 4:
+                    tx1, ty1, tx2, ty2 = bbox
+                    if tx2 > tx1 and ty2 > ty1:
+                        text_area += (tx2 - tx1) * (ty2 - ty1)
+
+            # OneOCR: text bboxes cover < 70% of bubble (precise line-level)
+            # VLM: text bboxes cover ~100% of bubble (cell-level)
+            is_oneocr = bubble_area > 0 and text_area < bubble_area * 0.7
+        else:
+            # No bubble_box provided - assume OneOCR if multiple texts
+            is_oneocr = True
+
+        if is_oneocr:
+            # OneOCR - bracket format for uncertain reading order
+            return "[" + ",".join(text_strings) + "]"
+        else:
+            # VLM - concatenate (VLM understands reading order)
+            return "".join(text_strings)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration Loading - Use centralized config module
 # ─────────────────────────────────────────────────────────────────────────────
@@ -74,6 +128,7 @@ from config import (
     find_llama, download_mmproj, build_llama_command,
     get_text_seg_enabled, get_text_seg_model, get_text_seg_input_size,
     is_api_ocr_method, get_gemini_api_key, get_gemini_model, get_gemini_translate_model,
+    get_debug_l1_boxes, get_debug_l2_boxes, get_debug_ocr_text, get_debug_save_overlay,
 )
 
 # Load configuration
@@ -492,6 +547,170 @@ def get_text_segmenter_instance() -> TextSegmenter:
     return _text_segmenter
 
 
+def draw_debug_overlay(images: List[Image.Image], bubbles_l1: List[Dict], bubbles_l2: List[Dict],
+                       ocr_data: Dict = None, output_dir: str = None, tab_title: str = None) -> List[Image.Image]:
+    """Draw debug visualization on images.
+
+    Args:
+        images: Output images to draw on
+        bubbles_l1: L1 bubbles (speech bubbles) with 'page_idx', 'box'
+        bubbles_l2: L2 bubbles (text-free regions) with 'page_idx', 'box'
+        ocr_data: OCR data per page for text overlay
+        output_dir: If set, save debug images to this directory
+        tab_title: Tab title for saving debug images
+
+    Returns:
+        Images with debug overlays drawn
+    """
+    from PIL import ImageDraw, ImageFont
+
+    debug_l1 = get_debug_l1_boxes()
+    debug_l2 = get_debug_l2_boxes()
+    debug_ocr = get_debug_ocr_text()
+    debug_save = get_debug_save_overlay()
+
+    if not (debug_l1 or debug_l2 or debug_ocr):
+        return images
+
+    print(f"  [Debug] Drawing overlays: L1={debug_l1}, L2={debug_l2}, OCR={debug_ocr}")
+    if debug_ocr and ocr_data:
+        print(f"  [Debug] OCR data keys: {list(ocr_data.keys())}")
+        for page_idx, page_data in ocr_data.items():
+            print(f"  [Debug] Page {page_idx}: {len(page_data)} bubbles")
+            for bd in page_data[:3]:  # Show first 3
+                texts = bd.get('texts', [])
+                text_preview = ''.join([t.get('text', '')[:20] for t in texts])
+                print(f"    box={bd.get('bubble_box')}, text='{text_preview}'")
+
+    # Colors for different labels
+    L1_COLOR = (0, 255, 0)         # Green for speech bubbles
+    L2_COLOR = (255, 0, 0)         # Red for text-free regions
+    OCR_BG_COLOR = (0, 0, 0, 220)  # Black background for OCR text
+    OCR_TEXT_COLOR = (255, 255, 0) # Yellow for OCR text
+
+    debug_images = []
+
+    # Try to get a font - use a larger size for visibility
+    font = None
+    font_size = 14
+    try:
+        # Try common font paths that support CJK characters
+        font_paths = [
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",  # macOS CJK
+            "/System/Library/Fonts/STHeiti Light.ttc",     # macOS CJK
+            "/System/Library/Fonts/AppleSDGothicNeo.ttc",  # macOS CJK
+            "/Library/Fonts/Arial Unicode.ttf",            # macOS Unicode
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",  # macOS
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",  # Linux
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",  # Linux CJK
+            "C:/Windows/Fonts/msgothic.ttc",  # Windows CJK
+            "C:/Windows/Fonts/arial.ttf",     # Windows
+        ]
+        for fp in font_paths:
+            if os.path.exists(fp):
+                font = ImageFont.truetype(fp, font_size)
+                print(f"  [Debug] Using font: {fp}")
+                break
+        if font is None:
+            font = ImageFont.load_default()
+            print(f"  [Debug] Using default font")
+    except Exception as e:
+        print(f"  [Debug] Font loading failed: {e}, using default")
+        try:
+            font = ImageFont.load_default()
+        except:
+            font = None
+
+    for page_idx, img in enumerate(images):
+        # Convert to RGBA for transparency
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
+
+        # Create overlay layer
+        overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        # Draw L1 boxes (speech bubbles)
+        if debug_l1:
+            for b in bubbles_l1:
+                if b['page_idx'] == page_idx:
+                    box = b['box']
+                    x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                    draw.rectangle([x1, y1, x2, y2], outline=L1_COLOR, width=3)
+                    # Draw label with background
+                    label = f"L1:{b['bubble_idx']}"
+                    label_x, label_y = x1 + 4, y1 + 4
+                    if font:
+                        try:
+                            lbox = draw.textbbox((label_x, label_y), label, font=font)
+                            draw.rectangle([lbox[0]-1, lbox[1]-1, lbox[2]+1, lbox[3]+1], fill=(0,0,0,200))
+                        except:
+                            pass
+                    draw.text((label_x, label_y), label, fill=L1_COLOR, font=font)
+
+        # Draw L2 boxes (text-free regions)
+        if debug_l2:
+            for b in bubbles_l2:
+                if b['page_idx'] == page_idx:
+                    box = b['box']
+                    x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                    draw.rectangle([x1, y1, x2, y2], outline=L2_COLOR, width=3)
+                    # Draw label with background
+                    label = f"L2:{b['bubble_idx']}"
+                    label_x, label_y = x1 + 4, y1 + 4
+                    if font:
+                        try:
+                            lbox = draw.textbbox((label_x, label_y), label, font=font)
+                            draw.rectangle([lbox[0]-1, lbox[1]-1, lbox[2]+1, lbox[3]+1], fill=(0,0,0,200))
+                        except:
+                            pass
+                    draw.text((label_x, label_y), label, fill=L2_COLOR, font=font)
+
+        # Draw OCR text overlay
+        if debug_ocr and ocr_data and page_idx in ocr_data:
+            for bubble_data in ocr_data[page_idx]:
+                box = bubble_data.get('bubble_box', [])
+                texts = bubble_data.get('texts', [])
+                if box and texts:
+                    x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                    # Combine OCR texts
+                    ocr_text = ''.join([t.get('text', '') for t in texts])[:60]  # Limit length
+                    if ocr_text:
+                        # Calculate text position - inside the box at top if box is near top of image
+                        text_y = y1 - font_size - 4 if y1 > font_size + 10 else y1 + 2
+                        text_x = x1 + 2
+
+                        # Get text bounding box
+                        if font:
+                            try:
+                                text_bbox = draw.textbbox((text_x, text_y), ocr_text, font=font)
+                            except:
+                                text_bbox = (text_x, text_y, text_x + len(ocr_text) * 8, text_y + font_size)
+                        else:
+                            text_bbox = (text_x, text_y, text_x + len(ocr_text) * 8, text_y + font_size)
+
+                        # Draw background rectangle
+                        draw.rectangle(
+                            [text_bbox[0] - 2, text_bbox[1] - 2, text_bbox[2] + 2, text_bbox[3] + 2],
+                            fill=OCR_BG_COLOR
+                        )
+                        # Draw text
+                        draw.text((text_x, text_y), ocr_text, fill=OCR_TEXT_COLOR, font=font)
+
+        # Composite overlay onto image
+        result = Image.alpha_composite(img, overlay)
+        debug_images.append(result.convert('RGB'))
+
+    # Save debug images if requested
+    if debug_save and output_dir and tab_title:
+        debug_dir = os.path.join(output_dir, 'debug', tab_title)
+        os.makedirs(debug_dir, exist_ok=True)
+        for i, img in enumerate(debug_images):
+            debug_path = os.path.join(debug_dir, f'debug_{i:03d}.png')
+            img.save(debug_path)
+        print(f"  [Debug] Saved {len(debug_images)} debug images to {debug_dir}")
+
+    return debug_images
 
 
 
@@ -528,10 +747,10 @@ def inpaint_image(img_array: np.ndarray, bubbles: List[Dict], inpainter: Inpaint
     return img_array, stats
 
 
-def process_images_label1(images: List[Image.Image], api_key: str = None, output_type: str = "full_page",
-                          ocr_translate: bool = False, translate_local: bool = False,
-                          inpaint_background: bool = True) -> Tuple[List[Dict], Any, Dict]:
-    """Process images for label 1 (text bubbles): detect -> OCR -> translate -> render
+def process_images(images: List[Image.Image], api_key: str = None, output_type: str = "full_page",
+                   ocr_translate: bool = False, translate_local: bool = False,
+                   inpaint_background: bool = True, tab_title: str = None) -> Tuple[List[Dict], Any, Dict]:
+    """Main processing pipeline: detect -> OCR -> translate -> AOT inpaint -> render
 
     Args:
         images: Input images
@@ -539,7 +758,7 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
         output_type: One of "full_page", "speech_image_only", "text_only"
         ocr_translate: If True, use VLM to OCR and translate in one step
         translate_local: If True, use local LLM (HY-MT) for translation instead of Cerebras API
-        inpaint_background: If True, detect label2 regions and inpaint them in parallel (AOT inpainting)
+        inpaint_background: If True, detect text-free regions and inpaint them in parallel (AOT inpainting)
 
     Returns:
         Tuple of (ocr_data, output, stats) where output varies by output_type
@@ -799,7 +1018,7 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
     # L1 texts
     for page_idx, page_bubbles in sorted(ocr_data.items()):
         for bubble in page_bubbles:
-            merged = "".join([t['text'] for t in bubble['texts']])
+            merged = merge_ocr_texts_for_translation(bubble['texts'], bubble.get('bubble_box'))
             if merged.strip():
                 all_texts.append(merged.strip())
                 text_mapping.append((page_idx, bubble['idx'], False))  # is_l2=False
@@ -809,7 +1028,7 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
     # L2 texts (separate batch tracking)
     for page_idx, page_bubbles in sorted(l2_ocr_data.items()):
         for bubble in page_bubbles:
-            merged = "".join([t['text'] for t in bubble['texts']])
+            merged = merge_ocr_texts_for_translation(bubble['texts'], bubble.get('bubble_box'))
             if merged.strip():
                 all_texts.append(merged.strip())
                 text_mapping.append((page_idx, bubble['idx'], True))  # is_l2=True
@@ -1079,11 +1298,20 @@ def process_images_label1(images: List[Image.Image], api_key: str = None, output
         # Print detailed render timing
         detail_str = f"text_seg={render_timing.get('text_seg_ms', 0)}ms, mask={render_timing.get('mask_apply_ms', 0)}ms, text={render_timing.get('text_render_ms', 0)}ms"
         print(f"  [Full Page] Rendered {len(output_images)} pages in {render_time}ms ({detail_str})" + (" (inpainted)" if use_inpaint else ""))
+
+        # Apply debug overlay if enabled
+        if get_debug_l1_boxes() or get_debug_l2_boxes() or get_debug_ocr_text():
+            from config import get_output_dir
+            output_images = draw_debug_overlay(
+                output_images, bubbles, bubbles_l2, ocr_data,
+                output_dir=get_output_dir(), tab_title=tab_title
+            )
+
         return ocr_data, output_images, stats
 
 
-def process_images_label2(images: List[Image.Image], api_key: str = None, output_type: str = "full_page") -> Tuple[List[Dict], Any, Dict]:
-    """Process images for label 2 (text-free): detect -> {inpaint, translate} parallel -> render
+def process_images_legacy(images: List[Image.Image], api_key: str = None, output_type: str = "full_page") -> Tuple[List[Dict], Any, Dict]:
+    """Legacy processing pipeline: detect -> {inpaint, translate} sequential -> render
 
     Args:
         images: Input images
@@ -1156,7 +1384,7 @@ def process_images_label2(images: List[Image.Image], api_key: str = None, output
 
     for page_idx, page_bubbles in sorted(ocr_data.items()):
         for bubble in page_bubbles:
-            merged = "".join([t['text'] for t in bubble['texts']])
+            merged = merge_ocr_texts_for_translation(bubble['texts'], bubble.get('bubble_box'))
             if merged.strip():
                 all_texts.append(merged.strip())
                 text_mapping.append((page_idx, bubble['idx']))
@@ -1329,9 +1557,9 @@ def images_to_base64(images: List[Image.Image]) -> List[str]:
     return result
 
 
-@app.route('/translate/label1', methods=['POST'])
-def translate_label1():
-    """Process text bubbles: detect -> OCR -> translate -> render"""
+@app.route('/api/v1/process', methods=['POST'])
+def process():
+    """Main pipeline: detect -> OCR -> translate -> AOT inpaint -> render"""
     start_time = time.time()
 
     if 'images' not in request.files:
@@ -1344,6 +1572,29 @@ def translate_label1():
     # Get optional parameters from form data
     api_key = request.form.get('api_key', None)
     output_type = request.form.get('output_type', 'full_page')
+
+    # Save options - for saving images before/after processing
+    # Use request value if provided, otherwise fall back to config defaults
+    from config import get_save_before, get_save_after
+    save_before_param = request.form.get('save_before', '')
+    save_after_param = request.form.get('save_after', '')
+
+    if save_before_param:
+        save_before = save_before_param.lower() in ('true', '1', 'yes')
+    else:
+        save_before = get_save_before()
+
+    if save_after_param:
+        save_after = save_after_param.lower() in ('true', '1', 'yes')
+    else:
+        save_after = get_save_after()
+
+    tab_title_raw = request.form.get('tab_title', 'untitled')
+    # Sanitize tab title for use as folder name (replace spaces with underscores)
+    tab_title = "".join(c if c.isalnum() or c in ('-', '_') else '_' for c in tab_title_raw).strip('_')[:50] or 'untitled'
+
+    # Debug save options
+    print(f"  Save options: before={save_before}, after={save_after}, tab_title='{tab_title}'")
 
     # Parse translation mode flags - apply defaults from config if not explicitly set
     ocr_translate_param = request.form.get('ocr_translate', None)
@@ -1382,6 +1633,14 @@ def translate_label1():
             img = Image.open(f.stream).convert('RGB')
             images.append(img)
 
+        # Save "before" images if requested
+        if save_before:
+            before_dir = os.path.join('output', 'before', tab_title)
+            os.makedirs(before_dir, exist_ok=True)
+            for idx, img in enumerate(images):
+                img.save(os.path.join(before_dir, f'image_{idx:03d}.png'))
+            print(f"  Saved {len(images)} 'before' images to {before_dir}/")
+
         # Build mode string for logging
         if ocr_translate:
             mode_str = "ocr_translate (VLM)"
@@ -1398,10 +1657,10 @@ def translate_label1():
         if translate_local and not ocr_translate:
             print(f"  Local translate: {'Available' if HAS_LOCAL_TRANSLATE else 'Not available'}")
         if inpaint_background:
-            print(f"  AOT Inpainting: Enabled (label2 regions inpainted in parallel)")
+            print(f"  AOT Inpainting: Enabled (text-free regions inpainted in parallel)")
 
         # Process
-        ocr_data, output, stats = process_images_label1(images, api_key, output_type, ocr_translate, translate_local, inpaint_background)
+        ocr_data, output, stats = process_images(images, api_key, output_type, ocr_translate, translate_local, inpaint_background, tab_title=tab_title)
 
         # Format response based on output_type
         elapsed = time.time() - start_time
@@ -1431,10 +1690,22 @@ def translate_label1():
             }
 
         else:  # full_page (default)
+            # Save "after" images if requested
+            if save_after:
+                after_dir = os.path.join('output', 'after', tab_title)
+                os.makedirs(after_dir, exist_ok=True)
+                for idx, img in enumerate(output):
+                    img.save(os.path.join(after_dir, f'image_{idx:03d}.png'))
+                print(f"  Saved {len(output)} 'after' images to {after_dir}/")
+
             # Encode output images
             t0 = time.time()
             output_b64 = images_to_base64(output)
             stats["encode_ms"] = int((time.time() - t0) * 1000)
+
+            # Format results as expected by frontend (array of {success, data_url})
+            # Add data URL prefix for browser compatibility
+            results = [{'success': True, 'data_url': f'data:image/jpeg;base64,{img_b64}'} for img_b64 in output_b64]
 
             response = {
                 'status': 'success',
@@ -1442,7 +1713,7 @@ def translate_label1():
                 'page_count': len(output),
                 'processing_time_ms': int(elapsed * 1000),
                 'stats': stats,
-                'images': output_b64
+                'results': results
             }
 
         print(f"  [Total] {elapsed:.2f}s")
@@ -1466,9 +1737,9 @@ def translate_label1():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/translate/label2', methods=['POST'])
-def translate_label2():
-    """Process with inpainting: detect -> {inpaint, translate} -> render"""
+@app.route('/api/v1/process/legacy', methods=['POST'])
+def process_legacy():
+    """Legacy sequential mode: detect -> {inpaint, translate} -> render"""
     start_time = time.time()
 
     if 'images' not in request.files:
@@ -1493,12 +1764,12 @@ def translate_label2():
             img = Image.open(f.stream).convert('RGB')
             images.append(img)
 
-        print(f"Processing {len(images)} images (label2 with inpainting, output_type={output_type})...")
+        print(f"Processing {len(images)} images (legacy mode with sequential inpainting, output_type={output_type})...")
         if api_key:
             print(f"  Using custom API key: {api_key[:10]}...")
 
         # Process
-        ocr_data, output, stats = process_images_label2(images, api_key, output_type)
+        ocr_data, output, stats = process_images_legacy(images, api_key, output_type)
 
         # Format response based on output_type
         elapsed = time.time() - start_time
@@ -1533,13 +1804,17 @@ def translate_label2():
             output_b64 = images_to_base64(output)
             stats["encode_ms"] = int((time.time() - t0) * 1000)
 
+            # Format results as expected by frontend (array of {success, data_url})
+            # Add data URL prefix for browser compatibility
+            results = [{'success': True, 'data_url': f'data:image/jpeg;base64,{img_b64}'} for img_b64 in output_b64]
+
             response = {
                 'status': 'success',
                 'output_type': 'full_page',
                 'page_count': len(output),
                 'processing_time_ms': int(elapsed * 1000),
                 'stats': stats,
-                'images': output_b64
+                'results': results
             }
 
         print(f"  Completed in {elapsed:.2f}s")
@@ -1557,6 +1832,238 @@ def translate_label2():
 def health():
     """Health check endpoint."""
     return jsonify({'status': 'ok'})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration API Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/api/config', methods=['GET'])
+def get_config():
+    """Get current configuration."""
+    from config import load_config
+    cfg = load_config()
+    return jsonify(cfg)
+
+
+@app.route('/api/config', methods=['POST'])
+def update_config():
+    """Update configuration. Partial updates supported."""
+    from config import load_config, save_config
+
+    try:
+        updates = request.get_json()
+        if not updates:
+            return jsonify({'error': 'No JSON data provided'}), 400
+
+        # Load current config and merge updates
+        cfg = load_config()
+        for key, value in updates.items():
+            if key in cfg:
+                cfg[key] = value
+
+        # Save updated config
+        save_config(cfg)
+
+        return jsonify(cfg)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/config/defaults', methods=['GET'])
+def get_config_defaults():
+    """Get default configuration values."""
+    from config import DEFAULT_CONFIG
+    return jsonify(DEFAULT_CONFIG)
+
+
+@app.route('/api/languages', methods=['GET'])
+def get_languages():
+    """Get list of supported target languages."""
+    from config import LANGUAGES
+    languages = [
+        {'code': code, 'name': name}
+        for code, name in LANGUAGES.items()
+    ]
+    return jsonify(languages)
+
+
+@app.route('/api/ocr-methods', methods=['GET'])
+def get_ocr_methods():
+    """Get list of available OCR methods with details."""
+    import platform
+    is_windows = platform.system() == 'Windows'
+
+    methods = [
+        {
+            'id': 'qwen_vlm',
+            'name': 'Qwen 3 VL 2B',
+            'description': 'Recommended - Good balance of speed and quality',
+            'vram': '~2.3GB',
+            'requires_api_key': False,
+            'requires_remote_url': False,
+        },
+        {
+            'id': 'lfm_vlm',
+            'name': 'LFM 2.5 VL 1.6B',
+            'description': 'Smallest and fastest local model',
+            'vram': '~1.7GB',
+            'requires_api_key': False,
+            'requires_remote_url': False,
+        },
+        {
+            'id': 'ministral_vlm_q8',
+            'name': 'Ministral 3B Q8',
+            'description': 'Best quality local model',
+            'vram': '~4.5GB',
+            'requires_api_key': False,
+            'requires_remote_url': False,
+        },
+        {
+            'id': 'oneocr_remote',
+            'name': 'OneOCR (Remote)',
+            'description': 'Network-based Windows OCR server',
+            'vram': '0GB',
+            'requires_api_key': False,
+            'requires_remote_url': True,
+        },
+        {
+            'id': 'gemini_api',
+            'name': 'Gemini API',
+            'description': 'Cloud-based OCR using Google Gemini',
+            'vram': '0GB',
+            'requires_api_key': True,
+            'api_key_type': 'gemini',
+            'requires_remote_url': False,
+        },
+    ]
+
+    # Add local OneOCR only on Windows
+    if is_windows:
+        methods.insert(0, {
+            'id': 'oneocr',
+            'name': 'OneOCR (Local)',
+            'description': 'Windows-only, uses no VRAM',
+            'vram': '0GB',
+            'requires_api_key': False,
+            'requires_remote_url': False,
+            'platform': 'windows',
+        })
+
+    return jsonify(methods)
+
+
+@app.route('/api/translation-methods', methods=['GET'])
+def get_translation_methods():
+    """Get list of available translation methods with details."""
+    methods = [
+        {
+            'id': 'hunyuan_mt',
+            'name': 'Hunyuan MT (Local)',
+            'description': 'Fast local translation model',
+            'vram': '~1.1GB',
+            'requires_api_key': False,
+        },
+        {
+            'id': 'cerebras_api',
+            'name': 'Cerebras API',
+            'description': 'Cloud-based, 1M tokens/day free tier',
+            'vram': '0GB',
+            'requires_api_key': True,
+            'api_key_type': 'cerebras',
+        },
+        {
+            'id': 'gemini_translate',
+            'name': 'Gemini API',
+            'description': 'Cloud-based translation using Google Gemini',
+            'vram': '0GB',
+            'requires_api_key': True,
+            'api_key_type': 'gemini',
+        },
+    ]
+    return jsonify(methods)
+
+
+@app.route('/api/verify/gemini-api-key', methods=['POST'])
+def verify_gemini_key():
+    """Verify a Gemini API key is valid."""
+    try:
+        data = request.get_json()
+        api_key = data.get('api_key', '')
+
+        if not api_key:
+            return jsonify({'valid': False, 'error': 'No API key provided'})
+
+        # Test the API key by making a simple request
+        import requests
+        test_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        response = requests.get(test_url, timeout=10)
+
+        if response.status_code == 200:
+            return jsonify({'valid': True, 'message': 'API key is valid'})
+        elif response.status_code == 400:
+            return jsonify({'valid': False, 'error': 'Invalid API key format'})
+        elif response.status_code == 403:
+            return jsonify({'valid': False, 'error': 'API key is invalid or expired'})
+        else:
+            return jsonify({'valid': False, 'error': f'Unexpected response: {response.status_code}'})
+
+    except requests.exceptions.Timeout:
+        return jsonify({'valid': False, 'error': 'Request timed out'})
+    except Exception as e:
+        return jsonify({'valid': False, 'error': str(e)})
+
+
+@app.route('/api/verify/cerebras-api-key', methods=['POST'])
+def verify_cerebras_key():
+    """Verify a Cerebras API key is valid."""
+    try:
+        data = request.get_json()
+        api_key = data.get('api_key', '')
+
+        if not api_key:
+            return jsonify({'valid': False, 'error': 'No API key provided'})
+
+        # Test the API key by making a simple request
+        import requests
+        test_url = "https://api.cerebras.ai/v1/models"
+        headers = {"Authorization": f"Bearer {api_key}"}
+        response = requests.get(test_url, headers=headers, timeout=10)
+
+        if response.status_code == 200:
+            return jsonify({'valid': True, 'message': 'API key is valid'})
+        elif response.status_code == 401:
+            return jsonify({'valid': False, 'error': 'Invalid API key'})
+        else:
+            return jsonify({'valid': False, 'error': f'Unexpected response: {response.status_code}'})
+
+    except requests.exceptions.Timeout:
+        return jsonify({'valid': False, 'error': 'Request timed out'})
+    except Exception as e:
+        return jsonify({'valid': False, 'error': str(e)})
+
+
+@app.route('/api/verify/oneocr-server', methods=['POST'])
+def verify_oneocr_server():
+    """Verify a OneOCR server is reachable."""
+    try:
+        data = request.get_json()
+        url = data.get('url', '')
+
+        if not url:
+            return jsonify({'valid': False, 'error': 'No URL provided'})
+
+        from config import verify_oneocr_server as check_oneocr
+        success, message, details = check_oneocr(url, timeout=5.0)
+
+        return jsonify({
+            'valid': success,
+            'message': message,
+            'details': details
+        })
+
+    except Exception as e:
+        return jsonify({'valid': False, 'error': str(e)})
 
 
 @app.route('/reset-vlm', methods=['POST'])
@@ -1697,8 +2204,8 @@ def _translate_batch_async(translate_batch_idx: int, bubble_infos: list, texts: 
         })
 
 
-@app.route('/translate/label1/stream', methods=['POST'])
-def translate_label1_stream():
+@app.route('/api/v1/process/stream', methods=['POST'])
+def process_stream():
     """
     SSE Streaming endpoint: detect -> parallel OCR+translate pipeline -> stream results
 
@@ -2071,9 +2578,10 @@ if __name__ == '__main__':
 
         # Endpoints
         console.print("\n[bold]Endpoints:[/bold]")
-        console.print("  [cyan]POST[/cyan] /translate/label1  [dim]- Text bubbles + AOT inpainting[/dim]")
-        console.print("  [cyan]POST[/cyan] /translate/label2  [dim]- Text-free regions[/dim]")
-        console.print("  [cyan]GET[/cyan]  /health            [dim]- Health check[/dim]")
+        console.print("  [cyan]POST[/cyan] /api/v1/process        [dim]- Main pipeline[/dim]")
+        console.print("  [cyan]POST[/cyan] /api/v1/process/stream [dim]- SSE streaming[/dim]")
+        console.print("  [cyan]POST[/cyan] /api/v1/process/legacy [dim]- Legacy sequential[/dim]")
+        console.print("  [cyan]GET[/cyan]  /health                [dim]- Health check[/dim]")
 
         # Status
         console.print("")
@@ -2129,11 +2637,11 @@ if __name__ == '__main__':
         if TRANSLATE_METHOD in ("qwen_vlm", "hunyuan_mt") and not (OCR_METHOD in ("qwen_vlm", "lfm_vlm", "ministral_vlm_q8") and TRANSLATE_METHOD == "qwen_vlm"):
             print(f"  {llama_server} -hf {get_translate_model()} --port 8081 -c {ctx} -ngl {ngl}")
 
-    # Pre-load detector only (inpainter loaded on-demand for label2)
+    # Pre-load detector only (inpainter loaded on-demand for legacy/AOT inpaint)
     print("\nLoading models...")
     get_detector()
     # get_inpainter()  # Loaded on-demand to save VRAM
-    print("Detector loaded. Inpainter will load on first label2 request.\n")
+    print("Detector loaded. Inpainter will load on first request requiring it.\n")
 
     port = int(os.environ.get('PORT', get_server_port()))
     app.run(host='0.0.0.0', port=port, debug=False)

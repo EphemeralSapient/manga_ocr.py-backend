@@ -141,7 +141,7 @@ def print_stats(response: dict):
     print(f"\n  TIMINGS:")
     print(f"    Detection:     {stats.get('detect_ms', 'N/A')}ms")
     if stats.get('label2_detected'):
-        print(f"    Label2 Regions:{stats.get('label2_detected', 0)}")
+        print(f"    Text-free Regions:{stats.get('label2_detected', 0)}")
     if stats.get('inpaint_l2_ms'):
         print(f"    Inpaint L2:    {stats.get('inpaint_l2_ms', 'N/A')}ms (parallel with OCR)")
     if stats.get('inpaint_l1_ms'):
@@ -178,14 +178,25 @@ def save_images(response: dict, image_paths: list, output_dir: str):
     if 'error' in response:
         return
 
-    images_b64 = response.get('images', [])
-    if not images_b64:
+    results = response.get('results', [])
+    if not results:
         print("  No images in response")
         return
 
     os.makedirs(output_dir, exist_ok=True)
 
-    for i, b64_data in enumerate(images_b64):
+    saved_count = 0
+    for i, result in enumerate(results):
+        if not result.get('success') or not result.get('data_url'):
+            continue
+
+        # Extract base64 data from data URL (remove "data:image/png;base64," prefix)
+        data_url = result['data_url']
+        if ',' in data_url:
+            b64_data = data_url.split(',', 1)[1]
+        else:
+            b64_data = data_url
+
         if i < len(image_paths):
             basename = os.path.basename(image_paths[i])
             name, ext = os.path.splitext(basename)
@@ -198,21 +209,22 @@ def save_images(response: dict, image_paths: list, output_dir: str):
         img_data = base64.b64decode(b64_data)
         with open(output_path, 'wb') as f:
             f.write(img_data)
+        saved_count += 1
 
-    print(f"\n  Saved {len(images_b64)} images to {output_dir}/")
+    print(f"\n  Saved {saved_count} images to {output_dir}/")
 
 
 def main():
     # Parse arguments
-    endpoint = "/translate/label1"
+    endpoint = "/api/v1/process"
     ocr_translate = False
     translate_local = False
     inpaint_background = True  # AOT inpainting enabled by default
 
     args = sys.argv[1:]
     for arg in args:
-        if arg in ['--label2', '-2', 'label2']:
-            endpoint = "/translate/label2"
+        if arg in ['--legacy', '-2', 'legacy']:
+            endpoint = "/api/v1/process/legacy"
         elif arg in ['--ocr-translate', '--vlm', '-v']:
             ocr_translate = True
         elif arg in ['--translate-local', '--local', '-l']:
@@ -223,16 +235,16 @@ def main():
             print("Usage: python3.12 test_client.py [options]")
             print("")
             print("Options:")
-            print("  --label1           Text bubbles only (default, with AOT inpainting)")
-            print("  --label2           Legacy mode with sequential inpainting")
+            print("  --legacy           Legacy sequential inpainting mode")
             print("  --no-inpaint       Disable AOT inpainting (white background only)")
             print("  --ocr-translate    Use VLM for combined OCR+translate (requires llama.cpp)")
             print("  --translate-local  Use local LLM for translation (HY-MT via llama.cpp)")
             print("")
             print("Modes:")
-            print("  Default:           VLM OCR -> Cerebras API translate + AOT inpaint (parallel)")
+            print("  Default:           VLM OCR -> API translate + AOT inpaint (parallel)")
             print("  --ocr-translate:   VLM OCR+translate in one step + AOT inpaint")
             print("  --translate-local: VLM OCR -> local LLM translate + AOT inpaint")
+            print("  --legacy:          Sequential processing mode")
             print("  --no-inpaint:      Disable background inpainting (white out text only)")
             print("")
             print(f"Input:  {INPUT_DIR}/")
@@ -286,7 +298,7 @@ def main():
         print_stats(response)
 
     # Save results
-    if 'images' in response:
+    if 'results' in response:
         if ocr_translate:
             suffix = "_vlm"
         elif translate_local:
@@ -295,7 +307,7 @@ def main():
             suffix = ""
         if inpaint_background:
             suffix += "_inpaint"
-        output_subdir = OUTPUT_DIR + ("_label2" if "label2" in endpoint else "_label1") + suffix
+        output_subdir = OUTPUT_DIR + ("_legacy" if "legacy" in endpoint else "") + suffix
         save_images(response, image_paths, output_subdir)
 
         print()

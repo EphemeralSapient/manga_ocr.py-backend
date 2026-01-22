@@ -89,9 +89,21 @@ class OneOCRRemote:
         image.save(buf, format='JPEG', quality=quality, optimize=True)
         img_b64 = base64.b64encode(buf.getvalue()).decode()
 
+        # Check if debug is enabled in config
+        debug_enabled = False
+        try:
+            from config import get_debug_save_overlay
+            debug_enabled = get_debug_save_overlay()
+        except:
+            pass
+
+        payload = {"image": img_b64}
+        if debug_enabled:
+            payload["debug"] = True
+
         resp = requests.post(
             f"{self.server_url}/ocr",
-            json={"image": img_b64},
+            json=payload,
             timeout=60  # 60s for large grids with many bubbles
         )
         resp.raise_for_status()
@@ -690,6 +702,48 @@ def map_ocr(ocr_result, positions, is_translated=None, verbose=False):
             if (gx1 - TOLERANCE) <= cx <= (gx2 + TOLERANCE) and (gy1 - TOLERANCE) <= cy <= (gy2 + TOLERANCE):
                 matched_pos = pos
                 break
+
+        # Fallback 1: Try matching with top-left corner (x1, y1)
+        # This helps when vertical text is detected with horizontal bbox orientation
+        if not matched_pos:
+            for pos in positions:
+                pos_batch = pos.get('batch_idx')
+                if line_batch is not None and pos_batch is not None and line_batch != pos_batch:
+                    continue
+
+                gx1, gy1, gx2, gy2 = pos['grid_box']
+
+                # Top-left corner inside grid_box = match
+                if (gx1 - TOLERANCE) <= ocr_x1 <= (gx2 + TOLERANCE) and (gy1 - TOLERANCE) <= ocr_y1 <= (gy2 + TOLERANCE):
+                    matched_pos = pos
+                    break
+
+        # Fallback 2: Try matching with ANY overlap between OCR bbox and grid_box
+        # This handles cases where Windows OCR returns completely wrong bbox dimensions
+        # but there's still some spatial overlap with the correct grid cell
+        if not matched_pos:
+            best_overlap = 0
+            best_overlap_pos = None
+            for pos in positions:
+                pos_batch = pos.get('batch_idx')
+                if line_batch is not None and pos_batch is not None and line_batch != pos_batch:
+                    continue
+
+                gx1, gy1, gx2, gy2 = pos['grid_box']
+
+                # Calculate overlap area
+                overlap_x = max(0, min(ocr_x2, gx2) - max(ocr_x1, gx1))
+                overlap_y = max(0, min(ocr_y2, gy2) - max(ocr_y1, gy1))
+                overlap_area = overlap_x * overlap_y
+
+                if overlap_area > best_overlap:
+                    best_overlap = overlap_area
+                    best_overlap_pos = pos
+
+            if best_overlap > 0:
+                matched_pos = best_overlap_pos
+                if verbose:
+                    print(f"  [map_ocr] Overlap match: '{text[:20]}' -> {matched_pos['key']} (overlap={best_overlap:.0f}px²)")
 
         if matched_pos:
             pos = matched_pos

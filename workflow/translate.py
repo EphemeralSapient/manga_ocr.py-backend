@@ -36,7 +36,14 @@ BATCH_SIZE = 100
 MAX_WORKERS = 5
 MODEL = "gpt-oss-120b"
 
-SYSTEM_PROMPT = """You are a Japanese to English translator for manga. Translate each numbered Japanese text to English accurately. Keep the same order. Return translations in the translated array WITHOUT numbers. If the input is meaningless (single random characters, sound effects like 'ぎゅっ', symbols, or gibberish that doesn't form proper text), return [NO TEXT] for that entry."""
+SYSTEM_PROMPT = """You are a Japanese to English translator for manga. Translate each numbered Japanese text to English accurately. Keep the same order. Return translations in the translated array WITHOUT numbers. If the input is meaningless (single random characters, sound effects like 'ぎゅっ', symbols, or gibberish that doesn't form proper text), return [NO TEXT] for that entry.
+
+IMPORTANT: Some inputs may be in bracketed format like [phrase1,phrase2] - this means multiple text segments were detected in the same speech bubble but the reading order is uncertain. Use Japanese grammar to determine the correct order:
+- Phrases ending with particles (に, を, が, は, で, etc.) usually continue to the next phrase
+- Phrases ending with verb forms (だ, です, る, た, か, よ, ね) usually complete a sentence
+- Adverbs (とりあえず, やっぱり, etc.) typically come before the verb phrase they modify
+
+Reorder the phrases to form a grammatically correct sentence, then translate naturally."""
 
 
 def translate_batch(

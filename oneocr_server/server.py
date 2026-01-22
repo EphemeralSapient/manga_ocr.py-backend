@@ -154,13 +154,27 @@ class OcrImage(ctypes.Structure):
     ]
 
 
-class BBox(ctypes.Structure):
+class BBoxQuad(ctypes.Structure):
+    """Bounding box as a quad (4 corner points = 8 floats).
+
+    The DLL returns bbox as 4 corner points in order:
+    - (x1, y1): top-left
+    - (x2, y2): top-right
+    - (x3, y3): bottom-right
+    - (x4, y4): bottom-left
+    """
     _fields_ = [
-        ("x", ctypes.c_float),
-        ("y", ctypes.c_float),
-        ("width", ctypes.c_float),
-        ("height", ctypes.c_float)
+        ("x1", ctypes.c_float), ("y1", ctypes.c_float),  # top-left
+        ("x2", ctypes.c_float), ("y2", ctypes.c_float),  # top-right
+        ("x3", ctypes.c_float), ("y3", ctypes.c_float),  # bottom-right
+        ("x4", ctypes.c_float), ("y4", ctypes.c_float),  # bottom-left
     ]
+
+    def to_rect(self):
+        """Convert quad to axis-aligned bounding rectangle [x1, y1, x2, y2]."""
+        xs = [self.x1, self.x2, self.x3, self.x4]
+        ys = [self.y1, self.y2, self.y3, self.y4]
+        return [min(xs), min(ys), max(xs), max(ys)]
 
 
 def _check_dll_arch(dll_path):
@@ -228,6 +242,23 @@ class OneOCR:
         d.GetOcrLineBoundingBox.argtypes = [i64, pi64]
         d.GetOcrLineBoundingBox.restype = i64
 
+        # Line style (returns 2 int32 values - may indicate text orientation)
+        d.GetOcrLineStyle.argtypes = [i64, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32)]
+        d.GetOcrLineStyle.restype = i64
+
+        # Word-level functions
+        d.GetOcrLineWordCount.argtypes = [i64, pi64]
+        d.GetOcrLineWordCount.restype = i64
+
+        d.GetOcrWord.argtypes = [i64, i64, pi64]
+        d.GetOcrWord.restype = i64
+
+        d.GetOcrWordBoundingBox.argtypes = [i64, pi64]
+        d.GetOcrWordBoundingBox.restype = i64
+
+        d.GetOcrWordContent.argtypes = [i64, pi64]
+        d.GetOcrWordContent.restype = i64
+
     def _init(self, max_lines):
         self._ctx = ctypes.c_int64()
         self._pipeline = ctypes.c_int64()
@@ -269,6 +300,11 @@ class OneOCR:
             List of dicts with 'text', 'bbox', 'confidence'
         """
         t0 = time.time()
+
+        # Get image dimensions BEFORE processing for DPI scaling fix
+        pil = Image.open(image_path)
+        img_w, img_h = pil.size
+
         ocr_img, data = self._prepare_image(image_path)
 
         result = ctypes.c_int64()
@@ -283,6 +319,9 @@ class OneOCR:
         self._dll.GetOcrLineCount(result.value, ctypes.byref(count))
 
         lines = []
+        max_x = 0
+        max_y = 0
+
         for i in range(count.value):
             line = ctypes.c_int64()
             if self._dll.GetOcrLine(result.value, i, ctypes.byref(line)) != 0:
@@ -296,30 +335,59 @@ class OneOCR:
             except:
                 continue
 
-            # Get bounding box
+            # Get line style (may indicate vertical/horizontal orientation)
+            style1 = ctypes.c_int32(0)
+            style2 = ctypes.c_int32(0)
+            style_res = self._dll.GetOcrLineStyle(line.value, ctypes.byref(style1), ctypes.byref(style2))
+            is_vertical = False
+            if style_res == 0:
+                # Check if style indicates vertical text
+                # style1 might be: 0=horizontal, 1=vertical (need to verify)
+                is_vertical = (style1.value == 1)
+                print(f"[OCR STYLE] '{text[:15]}': style1={style1.value}, style2={style2.value}, vertical={is_vertical}")
+
+            # Get line bounding box (quad format: 8 floats = 4 corner points)
             box_ptr = ctypes.c_int64()
             self._dll.GetOcrLineBoundingBox(line.value, ctypes.byref(box_ptr))
+            bbox = [0, 0, 0, 0]
             if box_ptr.value:
-                b = ctypes.cast(box_ptr.value, ctypes.POINTER(BBox)).contents
-                bbox = [b.x, b.y, b.x + b.width, b.y + b.height]
-            else:
-                bbox = [0, 0, 0, 0]
+                quad = ctypes.cast(box_ptr.value, ctypes.POINTER(BBoxQuad)).contents
+                bbox = quad.to_rect()
+                print(f"[OCR BBOX] '{text[:15]}': quad corners=({quad.x1:.0f},{quad.y1:.0f}),({quad.x2:.0f},{quad.y2:.0f}),({quad.x3:.0f},{quad.y3:.0f}),({quad.x4:.0f},{quad.y4:.0f}) -> rect=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]")
+
+            max_x = max(max_x, bbox[2])
+            max_y = max(max_y, bbox[3])
 
             lines.append({
                 'text': text,
                 'bbox': bbox,
-                'confidence': 1.0
+                'confidence': 1.0,
             })
+
+        # Clamp bboxes to image dimensions
+        print(f"[OCR DEBUG] Image: {img_w}x{img_h}, max_x={max_x:.1f}, max_y={max_y:.1f}")
+        for line in lines:
+            bbox = line['bbox']
+            line['bbox'] = [
+                max(0, min(bbox[0], img_w)),
+                max(0, min(bbox[1], img_h)),
+                max(0, min(bbox[2], img_w)),
+                max(0, min(bbox[3], img_h)),
+            ]
 
         elapsed = (time.time() - t0) * 1000
         print(f"[OCR] Recognized {len(lines)} lines in {elapsed:.0f}ms")
 
-        # Debug: Check for out-of-bounds coordinates
-        pil = Image.open(image_path)
-        img_w, img_h = pil.size
-        out_of_bounds = [l for l in lines if l['bbox'][2] > img_w or l['bbox'][3] > img_h]
+        # Final check - any boxes still outside bounds?
+        for line in lines:
+            bbox = line['bbox']
+            if bbox[2] > img_w or bbox[3] > img_h:
+                print(f"[OCR WARNING] Box still outside: {bbox} for '{line['text'][:20]}'")
+
+        # Debug: Check for remaining out-of-bounds coordinates
+        out_of_bounds = [l for l in lines if l['bbox'][2] > img_w + 1 or l['bbox'][3] > img_h + 1]
         if out_of_bounds:
-            print(f"[OCR] WARNING: {len(out_of_bounds)} lines have bbox outside image ({img_w}x{img_h}):")
+            print(f"[OCR] WARNING: {len(out_of_bounds)} lines still have bbox outside image ({img_w}x{img_h}):")
             for l in out_of_bounds[:5]:
                 print(f"  text='{l['text'][:20]}' bbox={l['bbox']}")
         return lines
@@ -373,14 +441,175 @@ def health():
     })
 
 
+def _save_debug_image(image, results, debug_dir, prefix="ocr_debug"):
+    """Save debug image with OCR bounding boxes drawn."""
+    from PIL import ImageDraw, ImageFont
+    import datetime
+
+    os.makedirs(debug_dir, exist_ok=True)
+
+    # Create a copy to draw on
+    debug_img = image.copy()
+    if debug_img.mode != 'RGB':
+        debug_img = debug_img.convert('RGB')
+
+    draw = ImageDraw.Draw(debug_img)
+
+    # Try to load a font
+    font = None
+    font_size = 10
+    try:
+        font_paths = [
+            "C:/Windows/Fonts/msgothic.ttc",
+            "C:/Windows/Fonts/arial.ttf",
+        ]
+        for fp in font_paths:
+            if os.path.exists(fp):
+                font = ImageFont.truetype(fp, font_size)
+                break
+    except:
+        pass
+
+    # Draw each OCR result with current interpretation
+    for i, r in enumerate(results):
+        bbox = r.get('bbox', [0, 0, 0, 0])
+        text = r.get('text', '')[:20]
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+
+        # Draw bbox rectangle (green = current)
+        draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=2)
+        draw.text((x1 + 2, y1 + 2), f"[{i}]", fill=(0, 255, 0), font=font)
+
+    # Save with timestamp
+    timestamp = datetime.datetime.now().strftime("%H%M%S")
+    debug_path = os.path.join(debug_dir, f"{prefix}_{timestamp}_{image.width}x{image.height}.png")
+    debug_img.save(debug_path)
+    print(f"[OCR Debug] Saved: {debug_path}")
+    return debug_path
+
+
+def _save_debug_image_all_variants(image, raw_results, debug_dir, prefix="ocr_variants"):
+    """Save debug image showing ALL possible bbox interpretations."""
+    from PIL import ImageDraw, ImageFont
+    import datetime
+
+    os.makedirs(debug_dir, exist_ok=True)
+
+    # Create a copy to draw on
+    debug_img = image.copy()
+    if debug_img.mode != 'RGB':
+        debug_img = debug_img.convert('RGB')
+
+    draw = ImageDraw.Draw(debug_img)
+
+    # Try to load a font
+    font = None
+    font_size = 9
+    try:
+        font_paths = ["C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/msgothic.ttc"]
+        for fp in font_paths:
+            if os.path.exists(fp):
+                font = ImageFont.truetype(fp, font_size)
+                break
+    except:
+        pass
+
+    # Color scheme for different interpretations
+    COLORS = {
+        'A': (255, 0, 0),     # Red: x,y,x+w,y+h (normal)
+        'B': (0, 255, 0),     # Green: x,y,x+h,y+w (swapped)
+        'C': (0, 0, 255),     # Blue: x,y,w,h (direct/no addition)
+        'D': (255, 255, 0),   # Yellow: y,x,h+y,w+x (x/y swapped)
+    }
+
+    for i, r in enumerate(raw_results):
+        x = r['raw_x']
+        y = r['raw_y']
+        w = r['raw_w']
+        h = r['raw_h']
+        text = r.get('text', '')[:15]
+
+        # Interpretation A: x, y, x+w, y+h (standard)
+        try:
+            ax1, ay1, ax2, ay2 = int(x), int(y), int(x+w), int(y+h)
+            if 0 <= ax1 < image.width and 0 <= ay1 < image.height:
+                draw.rectangle([ax1, ay1, min(ax2, image.width-1), min(ay2, image.height-1)],
+                              outline=COLORS['A'], width=2)
+                draw.text((ax1+2, ay1+2), f"A{i}", fill=COLORS['A'], font=font)
+        except: pass
+
+        # Interpretation B: x, y, x+h, y+w (swapped w/h)
+        try:
+            bx1, by1, bx2, by2 = int(x), int(y), int(x+h), int(y+w)
+            if 0 <= bx1 < image.width and 0 <= by1 < image.height:
+                draw.rectangle([bx1, by1, min(bx2, image.width-1), min(by2, image.height-1)],
+                              outline=COLORS['B'], width=2)
+                draw.text((bx1+2, by1+15), f"B{i}", fill=COLORS['B'], font=font)
+        except: pass
+
+        # Interpretation C: x, y, w, h as x1,y1,x2,y2 directly (no addition)
+        try:
+            cx1, cy1, cx2, cy2 = int(x), int(y), int(w), int(h)
+            if 0 <= cx1 < image.width and 0 <= cy1 < image.height and cx2 > cx1 and cy2 > cy1:
+                draw.rectangle([cx1, cy1, min(cx2, image.width-1), min(cy2, image.height-1)],
+                              outline=COLORS['C'], width=2)
+                draw.text((cx1+2, cy1+28), f"C{i}", fill=COLORS['C'], font=font)
+        except: pass
+
+        # Interpretation D: treat as center + half dimensions? x-w/2, y-h/2, x+w/2, y+h/2
+        try:
+            dx1, dy1, dx2, dy2 = int(x-w/2), int(y-h/2), int(x+w/2), int(y+h/2)
+            if 0 <= dx1 < image.width and 0 <= dy1 < image.height:
+                draw.rectangle([max(0,dx1), max(0,dy1), min(dx2, image.width-1), min(dy2, image.height-1)],
+                              outline=COLORS['D'], width=1)
+                draw.text((max(0,dx1)+2, max(0,dy1)+41), f"D{i}", fill=COLORS['D'], font=font)
+        except: pass
+
+    # Add legend
+    legend_y = 5
+    draw.text((5, legend_y), "A=x,y,x+w,y+h (RED)", fill=COLORS['A'], font=font)
+    draw.text((5, legend_y+12), "B=x,y,x+h,y+w (GREEN/swap)", fill=COLORS['B'], font=font)
+    draw.text((5, legend_y+24), "C=x,y,w,h direct (BLUE)", fill=COLORS['C'], font=font)
+    draw.text((5, legend_y+36), "D=center+half (YELLOW)", fill=COLORS['D'], font=font)
+
+    # Save
+    timestamp = datetime.datetime.now().strftime("%H%M%S")
+    debug_path = os.path.join(debug_dir, f"{prefix}_{timestamp}_{image.width}x{image.height}.png")
+    debug_img.save(debug_path)
+    print(f"[OCR Variants] Saved: {debug_path}")
+    return debug_path
+
+
+# Global debug flag - can be toggled via /debug endpoint
+_ocr_debug_enabled = False
+
+
+@app.route('/debug', methods=['GET', 'POST'])
+def toggle_debug():
+    """Toggle or check debug mode."""
+    global _ocr_debug_enabled
+    if request.method == 'POST':
+        data = request.get_json() if request.is_json else {}
+        if 'enabled' in data:
+            _ocr_debug_enabled = bool(data['enabled'])
+        else:
+            _ocr_debug_enabled = not _ocr_debug_enabled
+        print(f"[OCR Debug] Debug mode: {'ENABLED' if _ocr_debug_enabled else 'DISABLED'}")
+    return jsonify({
+        'debug_enabled': _ocr_debug_enabled,
+        'debug_dir': os.path.join(SCRIPT_DIR, 'debug_output')
+    })
+
+
 @app.route('/ocr', methods=['POST'])
 def ocr():
     """
     OCR endpoint - process image and return text.
 
     Accepts:
-        - JSON with base64 encoded image: {"image": "base64..."}
+        - JSON with base64 encoded image: {"image": "base64...", "debug": true}
         - Form data with image file: files['image']
+        - Query param: ?debug=1
 
     Returns:
         JSON with OCR results
@@ -389,7 +618,12 @@ def ocr():
 
     try:
         image = None
+        debug_this_request = _ocr_debug_enabled
         print(f"[OCR] Received request, content_type={request.content_type}")
+
+        # Check for debug flag in query string
+        if request.args.get('debug', '').lower() in ('1', 'true', 'yes'):
+            debug_this_request = True
 
         # Handle JSON request with base64 image
         if request.is_json:
@@ -399,6 +633,9 @@ def ocr():
                 image_data = base64.b64decode(data['image'])
                 image = Image.open(BytesIO(image_data))
                 print(f"[OCR] Image loaded: {image.size}, mode={image.mode}")
+            # Check debug flag in JSON
+            if data.get('debug'):
+                debug_this_request = True
 
         # Handle form data with file upload
         elif 'image' in request.files:
@@ -439,10 +676,50 @@ def ocr():
                     except:
                         pass  # File will be cleaned up by OS later
 
-            return jsonify({
+            # Save debug image if enabled
+            debug_path = None
+            if debug_this_request and results:
+                debug_dir = os.path.join(SCRIPT_DIR, 'debug_output')
+                os.makedirs(debug_dir, exist_ok=True)
+
+                import datetime
+                import json as json_module
+                timestamp = datetime.datetime.now().strftime("%H%M%S")
+
+                # Save the original "before" image (raw input)
+                before_path = os.path.join(debug_dir, f"before_{timestamp}_{image.width}x{image.height}.png")
+                image.save(before_path)
+                print(f"[OCR Debug] Saved before: {before_path}")
+
+                # Save INCOMING request details as JSON (exclude image data)
+                incoming_request = {
+                    'timestamp': timestamp,
+                    'method': request.method,
+                    'content_type': request.content_type,
+                    'content_length': request.content_length,
+                    'args': dict(request.args),
+                    'headers': {k: v for k, v in request.headers if k.lower() not in ['cookie', 'authorization']},
+                    'json_keys': list(request.get_json(silent=True).keys()) if request.is_json else None,
+                    'debug_flag': debug_this_request,
+                    'image_width': image.width,
+                    'image_height': image.height,
+                    'image_mode': image.mode,
+                }
+                request_json_path = os.path.join(debug_dir, f"incoming_{timestamp}_{image.width}x{image.height}.json")
+                with open(request_json_path, 'w', encoding='utf-8') as f:
+                    json_module.dump(incoming_request, f, indent=2, ensure_ascii=False)
+                print(f"[OCR Debug] Saved incoming request: {request_json_path}")
+
+                debug_path = _save_debug_image(image, results, debug_dir)
+
+            response = {
                 'success': True,
                 'results': results
-            })
+            }
+            if debug_path:
+                response['debug_image'] = debug_path
+
+            return jsonify(response)
 
         except Exception as e:
             print(f"[OCR] ERROR during OCR: {type(e).__name__}: {e}")
@@ -581,9 +858,13 @@ def main():
     print(f'  "oneocr_server_url": "http://{local_ip}:{args.port}"')
     print("-" * 60)
     print("\nEndpoints:")
-    print("  GET  /health     - Health check")
-    print("  POST /ocr        - OCR single image")
-    print("  POST /ocr/batch  - OCR multiple images")
+    print("  GET  /health       - Health check")
+    print("  POST /ocr          - OCR single image (?debug=1 for debug output)")
+    print("  POST /ocr/batch    - OCR multiple images")
+    print("  GET  /debug        - Check debug status")
+    print("  POST /debug        - Toggle debug mode (saves bbox images)")
+    print("-" * 60)
+    print(f"\nDebug output: {os.path.join(SCRIPT_DIR, 'debug_output')}")
     print("-" * 60)
     print("\nPress Ctrl+C to stop the server\n")
 

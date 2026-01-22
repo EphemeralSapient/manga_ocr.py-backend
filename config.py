@@ -90,6 +90,10 @@ DEFAULT_CONFIG = {
     "translate_model": "tencent/HY-MT1.5-1.8B-GGUF:HY-MT1.5-1.8B-Q4_K_M.gguf",
     "cerebras_api_key": "",
 
+    # Save options - save images before/after processing
+    "save_before": False,
+    "save_after": False,
+
     # Gemma/Gemini API settings (for gemini_api OCR and gemini_translate methods)
     # Uses Google AI Studio API - get key at https://aistudio.google.com/apikey
     # TIP: For higher rate limits, create multiple Projects in AI Studio (each has 30 req/min)
@@ -120,7 +124,7 @@ DEFAULT_CONFIG = {
     "sequential_model_loading": False,
 
     # Streaming mode - enable SSE streaming endpoints for real-time results
-    # When enabled: /translate/label1/stream endpoint becomes available
+    # When enabled: /api/v1/process/stream endpoint becomes available
     # Results stream back as OCR→translate batches complete (lower latency)
     "streaming_enabled": False,
 
@@ -133,6 +137,22 @@ DEFAULT_CONFIG = {
 
     "detection_threshold": 0.5,
     "detection_padding": 5,
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Debug Settings (config.json only)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # Draw L1 bounding boxes (speech bubbles) on output images
+    "debug_l1_boxes": False,
+
+    # Draw L2 bounding boxes (text-free regions) on output images
+    "debug_l2_boxes": False,
+
+    # Show OCR text overlay above each bubble
+    "debug_ocr_text": False,
+
+    # Save debug overlay images to output folder
+    "debug_save_overlay": False,
 
     # ══════════════════════════════════════════════════════════════════════════
     # Text Segmentation Settings (config.json only)
@@ -299,6 +319,12 @@ def get_translate_model() -> str:
 def get_cerebras_api_key() -> str:
     return get("cerebras_api_key", "")
 
+def get_save_before() -> bool:
+    return get("save_before", False)
+
+def get_save_after() -> bool:
+    return get("save_after", False)
+
 # Gemini API key rotation for rate limit management
 _gemini_key_index = 0
 _gemini_key_lock = None
@@ -377,6 +403,19 @@ def get_detection_threshold() -> float:
 
 def get_detection_padding() -> int:
     return get("detection_padding", 5)
+
+# Debug settings
+def get_debug_l1_boxes() -> bool:
+    return get("debug_l1_boxes", False)
+
+def get_debug_l2_boxes() -> bool:
+    return get("debug_l2_boxes", False)
+
+def get_debug_ocr_text() -> bool:
+    return get("debug_ocr_text", False)
+
+def get_debug_save_overlay() -> bool:
+    return get("debug_save_overlay", False)
 
 # Text segmentation settings
 def get_text_seg_enabled() -> bool:
