@@ -916,12 +916,14 @@ def process_images(images: List[Image.Image], api_key: str = None, output_type: 
 
         # Determine OCR method for L2 inpainting strategy
         uses_oneocr = OCR_METHOD in ("oneocr", "oneocr_remote")
+        aot_enabled = get_aot_inpaint_enabled_runtime()
 
         # For OneOCR: Run L2 OCR FIRST to get char bboxes, then inpaint with char bboxes
         # For VLM: Use text_seg for inpainting (runs in parallel with OCR)
+        # Skip L2 OCR for char bboxes if AOT is disabled (we'll just white fill)
         l2_char_bboxes = {}  # bubble_idx -> list of char bboxes
 
-        if bubbles_l2 and uses_oneocr:
+        if bubbles_l2 and uses_oneocr and aot_enabled:
             # Run L2 OCR first to get char bboxes for inpainting mask
             t_l2_ocr_start = time.time()
             print(f"  [OCR L2] Running OneOCR on {len(bubbles_l2)} regions for char bboxes...")
@@ -947,7 +949,6 @@ def process_images(images: List[Image.Image], api_key: str = None, output_type: 
             print(f"  [OCR L2] Extracted char bboxes for {len(l2_char_bboxes)}/{len(bubbles_l2)} regions")
 
         # Start inpainting (or white fill if AOT disabled)
-        aot_enabled = get_aot_inpaint_enabled_runtime()
         if bubbles_l2 and aot_enabled:
             inpainter = get_inpainter()
             # For OneOCR: use char bboxes; For VLM: use text_seg
