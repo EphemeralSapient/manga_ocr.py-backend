@@ -276,8 +276,10 @@ class OneOCR:
         self._dll.OcrProcessOptionsSetMaxRecognitionLineCount(self._opt.value, max_lines)
 
     def _prepare_image(self, image_path):
-        """Prepare image for OCR."""
+        """Prepare image for OCR. Returns (ocr_img, buffer, width, height)."""
         pil = Image.open(image_path)
+        img_w, img_h = pil.size
+
         if pil.mode != 'RGBA':
             pil = pil.convert('RGBA')
 
@@ -288,25 +290,58 @@ class OneOCR:
         # Create buffer
         buf = ctypes.create_string_buffer(bgra.tobytes())
         ocr_img = OcrImage(3, bgra.width, bgra.height, 0, bgra.width * 4, ctypes.addressof(buf))
-        return ocr_img, buf
+        return ocr_img, buf, img_w, img_h
 
-    def recognize(self, image_path):
+    def _get_char_bboxes(self, line_handle, img_w, img_h):
+        """Extract character/word-level bounding boxes for a line."""
+        word_count = ctypes.c_int64()
+        self._dll.GetOcrLineWordCount(line_handle, ctypes.byref(word_count))
+
+        chars = []
+        for wi in range(word_count.value):
+            word_handle = ctypes.c_int64()
+            if self._dll.GetOcrWord(line_handle, wi, ctypes.byref(word_handle)) != 0:
+                continue
+
+            # Get word/char text
+            word_txt_ptr = ctypes.c_int64()
+            self._dll.GetOcrWordContent(word_handle.value, ctypes.byref(word_txt_ptr))
+            try:
+                char_text = ctypes.cast(word_txt_ptr.value, ctypes.c_char_p).value.decode('utf-8')
+            except:
+                char_text = ""
+
+            # Get word/char bbox (quad format)
+            word_bbox_ptr = ctypes.c_int64()
+            self._dll.GetOcrWordBoundingBox(word_handle.value, ctypes.byref(word_bbox_ptr))
+
+            if word_bbox_ptr.value:
+                quad = ctypes.cast(word_bbox_ptr.value, ctypes.POINTER(BBoxQuad)).contents
+                cb = quad.to_rect()
+                chars.append({
+                    'char': char_text,
+                    'bbox': [max(0, min(cb[0], img_w)), max(0, min(cb[1], img_h)),
+                             max(0, min(cb[2], img_w)), max(0, min(cb[3], img_h))],
+                })
+            else:
+                chars.append({'char': char_text, 'bbox': [0, 0, 0, 0]})
+
+        return chars
+
+    def recognize(self, image_path, char_bbox=False):
         """Run OCR on image file.
 
         Args:
             image_path: Path to image file
+            char_bbox: If True, include character-level bounding boxes
 
         Returns:
-            List of dicts with 'text', 'bbox', 'confidence'
+            List of dicts with 'text', 'bbox', 'confidence', and optionally 'chars'
         """
-        t0 = time.time()
+        # Prepare image (only open once)
+        ocr_img, buf, img_w, img_h = self._prepare_image(image_path)
 
-        # Get image dimensions BEFORE processing for DPI scaling fix
-        pil = Image.open(image_path)
-        img_w, img_h = pil.size
-
-        ocr_img, data = self._prepare_image(image_path)
-
+        # Run OCR pipeline
         result = ctypes.c_int64()
         self._dll.RunOcrPipeline(
             self._pipeline.value,
@@ -315,13 +350,11 @@ class OneOCR:
             ctypes.byref(result)
         )
 
+        # Get line count
         count = ctypes.c_int64()
         self._dll.GetOcrLineCount(result.value, ctypes.byref(count))
 
         lines = []
-        max_x = 0
-        max_y = 0
-
         for i in range(count.value):
             line = ctypes.c_int64()
             if self._dll.GetOcrLine(result.value, i, ctypes.byref(line)) != 0:
@@ -335,69 +368,51 @@ class OneOCR:
             except:
                 continue
 
-            # Get line style (may indicate vertical/horizontal orientation)
-            style1 = ctypes.c_int32(0)
-            style2 = ctypes.c_int32(0)
-            style_res = self._dll.GetOcrLineStyle(line.value, ctypes.byref(style1), ctypes.byref(style2))
-            is_vertical = False
-            if style_res == 0:
-                # Check if style indicates vertical text
-                # style1 might be: 0=horizontal, 1=vertical (need to verify)
-                is_vertical = (style1.value == 1)
-                print(f"[OCR STYLE] '{text[:15]}': style1={style1.value}, style2={style2.value}, vertical={is_vertical}")
-
             # Get line bounding box (quad format: 8 floats = 4 corner points)
             box_ptr = ctypes.c_int64()
             self._dll.GetOcrLineBoundingBox(line.value, ctypes.byref(box_ptr))
-            bbox = [0, 0, 0, 0]
+
             if box_ptr.value:
                 quad = ctypes.cast(box_ptr.value, ctypes.POINTER(BBoxQuad)).contents
-                bbox = quad.to_rect()
-                print(f"[OCR BBOX] '{text[:15]}': quad corners=({quad.x1:.0f},{quad.y1:.0f}),({quad.x2:.0f},{quad.y2:.0f}),({quad.x3:.0f},{quad.y3:.0f}),({quad.x4:.0f},{quad.y4:.0f}) -> rect=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]")
+                b = quad.to_rect()
+                bbox = [max(0, min(b[0], img_w)), max(0, min(b[1], img_h)),
+                        max(0, min(b[2], img_w)), max(0, min(b[3], img_h))]
+            else:
+                bbox = [0, 0, 0, 0]
 
-            max_x = max(max_x, bbox[2])
-            max_y = max(max_y, bbox[3])
-
-            lines.append({
+            line_result = {
                 'text': text,
                 'bbox': bbox,
                 'confidence': 1.0,
-            })
+            }
 
-        # Clamp bboxes to image dimensions
-        print(f"[OCR DEBUG] Image: {img_w}x{img_h}, max_x={max_x:.1f}, max_y={max_y:.1f}")
-        for line in lines:
-            bbox = line['bbox']
-            line['bbox'] = [
-                max(0, min(bbox[0], img_w)),
-                max(0, min(bbox[1], img_h)),
-                max(0, min(bbox[2], img_w)),
-                max(0, min(bbox[3], img_h)),
-            ]
+            # Add character-level bboxes if requested
+            if char_bbox:
+                line_result['chars'] = self._get_char_bboxes(line.value, img_w, img_h)
 
-        elapsed = (time.time() - t0) * 1000
-        print(f"[OCR] Recognized {len(lines)} lines in {elapsed:.0f}ms")
-
-        # Final check - any boxes still outside bounds?
-        for line in lines:
-            bbox = line['bbox']
-            if bbox[2] > img_w or bbox[3] > img_h:
-                print(f"[OCR WARNING] Box still outside: {bbox} for '{line['text'][:20]}'")
-
-        # Debug: Check for remaining out-of-bounds coordinates
-        out_of_bounds = [l for l in lines if l['bbox'][2] > img_w + 1 or l['bbox'][3] > img_h + 1]
-        if out_of_bounds:
-            print(f"[OCR] WARNING: {len(out_of_bounds)} lines still have bbox outside image ({img_w}x{img_h}):")
-            for l in out_of_bounds[:5]:
-                print(f"  text='{l['text'][:20]}' bbox={l['bbox']}")
+            lines.append(line_result)
         return lines
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OneOCR Instance
+# OneOCR Instance (with thread-safe sequential processing)
 # ─────────────────────────────────────────────────────────────────────────────
 
+import threading
+import queue
+
 _ocr_engine = None
+_ocr_lock = threading.Lock()  # Ensures sequential OCR processing
+_request_counter = 0
+_request_counter_lock = threading.Lock()
+
+
+def _get_request_id():
+    """Get unique request ID for logging."""
+    global _request_counter
+    with _request_counter_lock:
+        _request_counter += 1
+        return _request_counter
 
 
 def _get_ocr_engine():
@@ -410,17 +425,24 @@ def _get_ocr_engine():
     return _ocr_engine
 
 
-def _run_oneocr(image_path: str) -> list:
-    """Run OneOCR on an image file.
+_ocr_page_count = 0
 
-    Args:
-        image_path: Path to image file
+def _run_oneocr(image_path: str, char_bbox: bool = False) -> list:
+    """Run OneOCR on an image file (thread-safe, sequential processing)."""
+    global _ocr_page_count
+    import time
 
-    Returns:
-        List of dicts with 'text', 'confidence', 'bbox'
-    """
-    ocr = _get_ocr_engine()
-    return ocr.recognize(image_path)
+    with _ocr_lock:
+        _ocr_page_count += 1
+        page_num = _ocr_page_count
+        t0 = time.time()
+
+        ocr = _get_ocr_engine()
+        results = ocr.recognize(image_path, char_bbox=char_bbox)
+
+        elapsed = (time.time() - t0) * 1000
+        print(f"[OCR] Page {page_num}: {len(results)} lines in {elapsed:.0f}ms")
+        return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -607,56 +629,59 @@ def ocr():
     OCR endpoint - process image and return text.
 
     Accepts:
-        - JSON with base64 encoded image: {"image": "base64...", "debug": true}
+        - JSON with base64 encoded image: {"image": "base64...", "debug": true, "char_bbox": true}
         - Form data with image file: files['image']
-        - Query param: ?debug=1
+        - Query params: ?debug=1&char_bbox=1
+
+    Parameters:
+        - debug: Enable debug output (saves bbox images)
+        - char_bbox: Include character-level bounding boxes in response
 
     Returns:
-        JSON with OCR results
-    """
-    import traceback
+        JSON with OCR results. If char_bbox=true, each line includes 'chars' array
+        with individual character bboxes.
 
+    Note: Requests are received in parallel but OCR processing is sequential
+    (protected by _ocr_lock) to ensure thread-safety of the OCR engine.
+    """
     try:
         image = None
         debug_this_request = _ocr_debug_enabled
-        print(f"[OCR] Received request, content_type={request.content_type}")
+        char_bbox_enabled = False
 
-        # Check for debug flag in query string
+        # Check for flags in query string
         if request.args.get('debug', '').lower() in ('1', 'true', 'yes'):
             debug_this_request = True
+        if request.args.get('char_bbox', '').lower() in ('1', 'true', 'yes'):
+            char_bbox_enabled = True
 
         # Handle JSON request with base64 image
         if request.is_json:
             data = request.get_json()
             if 'image' in data:
-                print(f"[OCR] Decoding base64 image ({len(data['image'])} chars)")
                 image_data = base64.b64decode(data['image'])
                 image = Image.open(BytesIO(image_data))
-                print(f"[OCR] Image loaded: {image.size}, mode={image.mode}")
-            # Check debug flag in JSON
             if data.get('debug'):
                 debug_this_request = True
+            if data.get('char_bbox'):
+                char_bbox_enabled = True
 
         # Handle form data with file upload
         elif 'image' in request.files:
-            print("[OCR] Loading from form file upload")
             image = Image.open(request.files['image'])
 
         # Handle raw image data
         elif request.data:
-            print(f"[OCR] Loading from raw data ({len(request.data)} bytes)")
             image = Image.open(BytesIO(request.data))
 
         if image is None:
-            print("[OCR] ERROR: No image provided in request")
             return jsonify({'error': 'No image provided'}), 400
 
         # Convert to RGB if needed
         if image.mode != 'RGB':
-            print(f"[OCR] Converting from {image.mode} to RGB")
             image = image.convert('RGB')
 
-        # Run OCR using local OneOCR wrapper (no external deps needed)
+        # Run OCR
         try:
             import tempfile
             tmp_path = None
@@ -664,10 +689,7 @@ def ocr():
                 with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
                     tmp_path = tmp.name
                     image.save(tmp_path)
-                print(f"[OCR] Saved temp image: {tmp_path}")
-                print(f"[OCR] Running OneOCR...")
-                results = _run_oneocr(tmp_path)
-                print(f"[OCR] Got {len(results) if results else 0} results")
+                results = _run_oneocr(tmp_path, char_bbox=char_bbox_enabled)
             finally:
                 # Clean up temp file (ignore errors - Windows may hold the file)
                 if tmp_path:

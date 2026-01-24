@@ -61,6 +61,54 @@ from workflow import translate_texts
 from workflow import translate_texts_gemini, HAS_GEMINI_TRANSLATE
 
 
+import re
+
+# CJK Unicode ranges for detecting text that needs translation
+_CJK_RANGES = (
+    '\u4e00-\u9fff'    # CJK Unified Ideographs (Chinese)
+    '\u3040-\u309f'    # Hiragana (Japanese)
+    '\u30a0-\u30ff'    # Katakana (Japanese)
+    '\uac00-\ud7af'    # Hangul Syllables (Korean)
+    '\u1100-\u11ff'    # Hangul Jamo (Korean)
+    '\u3130-\u318f'    # Hangul Compatibility Jamo
+    '\uff66-\uff9f'    # Halfwidth Katakana
+)
+_CJK_PATTERN = re.compile(f'[{_CJK_RANGES}]')
+
+
+def should_translate(text: str, min_cjk_ratio: float = 0.2) -> bool:
+    """
+    Check if text should be translated based on CJK content ratio.
+
+    Returns True if text has enough CJK characters to warrant translation.
+    Skips text that's mostly English/numbers (like stats: LV:100, HP:2000, MAX:999).
+
+    Args:
+        text: Text to check
+        min_cjk_ratio: Minimum ratio of CJK characters (default 0.2 = 20%)
+    """
+    if not text:
+        return False
+
+    # Count CJK characters
+    cjk_chars = len(_CJK_PATTERN.findall(text))
+
+    # Count meaningful characters (exclude spaces, punctuation)
+    meaningful = sum(1 for c in text if c.isalnum() or ord(c) > 127)
+
+    if meaningful == 0:
+        return False
+
+    # If mostly CJK (>30%), translate it
+    # This skips stats panels like "LV:100 HP:2000 ポチ" where CJK is minority
+    return cjk_chars / meaningful >= min_cjk_ratio
+
+
+def contains_cjk(text: str) -> bool:
+    """Check if text contains any CJK - use should_translate() for smarter check."""
+    return bool(_CJK_PATTERN.search(text))
+
+
 def merge_ocr_texts_for_translation(texts: list, bubble_box: list = None) -> str:
     """
     Merge OCR text items for translation.
@@ -106,8 +154,8 @@ def merge_ocr_texts_for_translation(texts: list, bubble_box: list = None) -> str
             is_oneocr = True
 
         if is_oneocr:
-            # OneOCR - bracket format for uncertain reading order
-            return "[" + ",".join(text_strings) + "]"
+            # OneOCR - newline-separated for LLM to understand context and order
+            return "\n".join(text_strings)
         else:
             # VLM - concatenate (VLM understands reading order)
             return "".join(text_strings)
@@ -518,6 +566,21 @@ _text_segmenter = None
 
 # Text segmentation config
 TEXT_SEG_ENABLED = get_text_seg_enabled()
+# Force text_seg mask for text clearing instead of OneOCR char bboxes (slower but more precise)
+# Can be set via config.json or environment variable: FORCE_TEXT_SEG_MASK=1
+from config import get_force_text_seg_mask, get_aot_inpaint_enabled
+
+def get_force_text_seg_mask_runtime() -> bool:
+    """Get force_text_seg_mask setting (reads from config each time for dynamic updates)."""
+    if os.environ.get('FORCE_TEXT_SEG_MASK', '').lower() in ('1', 'true', 'yes'):
+        return True
+    return get_force_text_seg_mask()
+
+def get_aot_inpaint_enabled_runtime() -> bool:
+    """Get aot_inpaint_enabled setting (reads from config each time for dynamic updates)."""
+    if os.environ.get('AOT_INPAINT_ENABLED', '').lower() in ('0', 'false', 'no'):
+        return False
+    return get_aot_inpaint_enabled()
 
 
 def get_detector():
@@ -716,14 +779,18 @@ def draw_debug_overlay(images: List[Image.Image], bubbles_l1: List[Dict], bubble
 
 
 def inpaint_image(img_array: np.ndarray, bubbles: List[Dict], inpainter: Inpainter,
-                  text_segmenter: TextSegmenter = None, verbose: bool = False) -> Tuple[np.ndarray, Dict]:
-    """Inpaint L2 regions using AOT-GAN on the whole bbox.
+                  text_segmenter: TextSegmenter = None, char_bboxes_map: Dict = None,
+                  verbose: bool = False) -> Tuple[np.ndarray, Dict]:
+    """Inpaint L2 regions using AOT-GAN.
+
+    Mask source priority: char_bboxes > text_segmenter > whole bbox
 
     Args:
         img_array: Input image as numpy array
-        bubbles: List of bubble dicts with 'bubble_box'
+        bubbles: List of bubble dicts with 'bubble_box' and 'bubble_idx'
         inpainter: Inpainter instance for AOT-GAN inpainting
-        text_segmenter: Unused for L2 (kept for API compatibility)
+        text_segmenter: If provided, use text_seg mask to only inpaint text pixels
+        char_bboxes_map: Dict mapping bubble_idx to list of char bboxes from OneOCR
         verbose: If True, log each operation
 
     Returns:
@@ -731,11 +798,50 @@ def inpaint_image(img_array: np.ndarray, bubbles: List[Dict], inpainter: Inpaint
     """
     inpainter.reset_stats()
 
+    mode = "char_bbox" if char_bboxes_map else ("text_seg" if text_segmenter else "bbox")
     if verbose:
-        print(f"  [Inpaint L2] Processing {len(bubbles)} regions (AOT bbox)...")
+        print(f"  [Inpaint L2] Processing {len(bubbles)} regions ({mode})...")
 
     for i, bubble in enumerate(bubbles):
         bbox = bubble["bubble_box"]
+        bubble_idx = bubble.get("bubble_idx", i)
+        x1, y1, x2, y2 = bbox
+
+        # Priority 1: Use char bboxes from OneOCR
+        if char_bboxes_map and bubble_idx in char_bboxes_map:
+            char_bboxes = char_bboxes_map[bubble_idx]
+            if char_bboxes:
+                # Create mask from char bboxes
+                region_h, region_w = y2 - y1, x2 - x1
+                char_mask = np.zeros((region_h, region_w), dtype=np.uint8)
+                for cb in char_bboxes:
+                    cx1, cy1, cx2, cy2 = cb
+                    # Convert to region coordinates
+                    cx1_rel = max(0, cx1 - x1)
+                    cy1_rel = max(0, cy1 - y1)
+                    cx2_rel = min(region_w, cx2 - x1)
+                    cy2_rel = min(region_h, cy2 - y1)
+                    if cx2_rel > cx1_rel and cy2_rel > cy1_rel:
+                        char_mask[cy1_rel:cy2_rel, cx1_rel:cx2_rel] = 255
+
+                if np.any(char_mask > 0):
+                    coords, result = inpainter.inpaint_with_mask(img_array, bbox, char_mask, verbose=verbose)
+                    img_array[coords[0]:coords[1], coords[2]:coords[3]] = result
+                    continue
+
+        # Priority 2: Use text_segmenter
+        if text_segmenter:
+            region = img_array[y1:y2, x1:x2]
+            if region.size == 0:
+                continue
+
+            text_mask = text_segmenter(region, verbose=False)
+            if text_mask is not None and np.any(text_mask > 127):
+                coords, result = inpainter.inpaint_with_mask(img_array, bbox, text_mask, verbose=verbose)
+                img_array[coords[0]:coords[1], coords[2]:coords[3]] = result
+                continue
+
+        # Priority 3: Fallback to whole bbox
         coords, result = inpainter(img_array, bbox, verbose=verbose)
         img_array[coords[0]:coords[1], coords[2]:coords[3]] = result
 
@@ -778,6 +884,11 @@ def process_images(images: List[Image.Image], api_key: str = None, output_type: 
     # Track L2 data for later rendering (kept separate from L1)
     l2_data = {}
     l2_ocr_data = {}  # Separate OCR data for L2
+    l2_skipped_regions = []  # Non-CJK L2 regions to restore from original
+    # Cache L2 OCR results (to avoid running twice when using OneOCR)
+    l2_ocr_cached = None
+    l2_positions_cached = None
+    l2_ocr_time_cached = 0
 
     # Parallel executor for background tasks
     _parallel_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
@@ -803,9 +914,44 @@ def process_images(images: List[Image.Image], api_key: str = None, output_type: 
                 'bubble_idx': b['bubble_idx']
             })
 
-        # Start inpainting in parallel with OCR
-        if bubbles_l2:
+        # Determine OCR method for L2 inpainting strategy
+        uses_oneocr = OCR_METHOD in ("oneocr", "oneocr_remote")
+
+        # For OneOCR: Run L2 OCR FIRST to get char bboxes, then inpaint with char bboxes
+        # For VLM: Use text_seg for inpainting (runs in parallel with OCR)
+        l2_char_bboxes = {}  # bubble_idx -> list of char bboxes
+
+        if bubbles_l2 and uses_oneocr:
+            # Run L2 OCR first to get char bboxes for inpainting mask
+            t_l2_ocr_start = time.time()
+            print(f"  [OCR L2] Running OneOCR on {len(bubbles_l2)} regions for char bboxes...")
+            l2_ocr_cached, l2_positions_cached, _ = run_ocr_on_bubbles(bubbles_l2, translate=False)
+            l2_ocr_time_cached = int((time.time() - t_l2_ocr_start) * 1000)
+            print(f"  [OCR L2] Got {l2_ocr_cached.get('line_count', 0)} lines in {l2_ocr_time_cached}ms")
+            stats["ocr_l2_ms"] = l2_ocr_time_cached
+            stats["ocr_l2_lines"] = l2_ocr_cached.get('line_count', 0)
+
+            # Extract char bboxes from OCR result
+            l2_bubble_texts_for_mask = map_ocr(l2_ocr_cached, l2_positions_cached)
+            for (page_idx, bubble_idx), texts in l2_bubble_texts_for_mask.items():
+                all_chars = []
+                for text_item in texts:
+                    chars = text_item.get('chars', [])
+                    for c in chars:
+                        cb = c.get('bbox')
+                        if cb and len(cb) == 4:
+                            all_chars.append(cb)
+                if all_chars:
+                    l2_char_bboxes[bubble_idx] = all_chars
+
+            print(f"  [OCR L2] Extracted char bboxes for {len(l2_char_bboxes)}/{len(bubbles_l2)} regions")
+
+        # Start inpainting (or white fill if AOT disabled)
+        aot_enabled = get_aot_inpaint_enabled_runtime()
+        if bubbles_l2 and aot_enabled:
             inpainter = get_inpainter()
+            # For OneOCR: use char bboxes; For VLM: use text_seg
+            l2_text_seg = None if uses_oneocr else (get_text_segmenter_instance() if TEXT_SEG_ENABLED else None)
 
             def do_inpainting():
                 t_start = time.time()
@@ -815,21 +961,68 @@ def process_images(images: List[Image.Image], api_key: str = None, output_type: 
                     img_array = np.array(img)
                     page_l2 = l2_data.get(page_idx, [])
                     if page_l2:
-                        img_array, page_stats = inpaint_image(img_array, page_l2, inpainter, None, verbose=False)
+                        img_array, page_stats = inpaint_image(
+                            img_array, page_l2, inpainter,
+                            text_segmenter=l2_text_seg,
+                            char_bboxes_map=l2_char_bboxes if uses_oneocr else None,
+                            verbose=False
+                        )
                         total_regions += page_stats.get('count', 0)
                     inpainted.append(Image.fromarray(img_array))
                 elapsed_ms = int((time.time() - t_start) * 1000)
-                print(f"  [Inpaint L2] {total_regions} regions in {elapsed_ms}ms")
+                mode_str = " (char_bbox)" if uses_oneocr else (" (text_seg)" if l2_text_seg else "")
+                print(f"  [Inpaint L2] {total_regions} regions in {elapsed_ms}ms{mode_str}")
                 return inpainted, elapsed_ms
 
             inpaint_future = _parallel_executor.submit(do_inpainting)
+        elif bubbles_l2 and not aot_enabled:
+            # AOT disabled - fill L2 regions with white instead
+            def do_white_fill():
+                t_start = time.time()
+                filled = []
+                total_regions = 0
+                for page_idx, img in enumerate(images):
+                    img_array = np.array(img)
+                    page_l2 = l2_data.get(page_idx, [])
+                    for bubble in page_l2:
+                        bbox = bubble["bubble_box"]
+                        x1, y1, x2, y2 = bbox
+                        img_array[y1:y2, x1:x2] = 255  # Fill with white
+                        total_regions += 1
+                    filled.append(Image.fromarray(img_array))
+                elapsed_ms = int((time.time() - t_start) * 1000)
+                print(f"  [L2 White Fill] {total_regions} regions in {elapsed_ms}ms (AOT disabled)")
+                return filled, elapsed_ms
+
+            inpaint_future = _parallel_executor.submit(do_white_fill)
     else:
         print(f"  [Detect] {len(bubbles)} bubbles in {detect_time:.0f}ms")
+        uses_oneocr = OCR_METHOD in ("oneocr", "oneocr_remote")
 
-    # DEBUG: Log detected bubbles
-    print(f"  [DEBUG Detected L1 Bubbles]")
-    for b in bubbles:
-        print(f"    page={b['page_idx']}, idx={b['bubble_idx']}, box={list(b['box'])}")
+    # Start text segmentation in PARALLEL with OCR (right after detection)
+    # Skip text_seg when using OneOCR (unless force_text_seg_mask is set)
+    force_text_seg = get_force_text_seg_mask_runtime()
+    pages_with_bubbles = set(b['page_idx'] for b in bubbles) | set(b['page_idx'] for b in bubbles_l2)
+    skip_text_seg = uses_oneocr and not force_text_seg
+    if text_seg is not None and pages_with_bubbles and not skip_text_seg:
+        def do_text_segmentation_on_pages():
+            t_start = time.time()
+            page_masks = {}
+            for page_idx in pages_with_bubbles:
+                if page_idx < len(images):
+                    page_array = np.array(images[page_idx])
+                    page_masks[page_idx] = text_seg(page_array, verbose=False)
+            elapsed_ms = int((time.time() - t_start) * 1000)
+            mode_note = " (force_text_seg_mask)" if force_text_seg else ""
+            print(f"  [TextSeg] {len(page_masks)}/{len(images)} pages (with bubbles) in {elapsed_ms}ms{mode_note}")
+            return page_masks, elapsed_ms
+        text_seg_future = _parallel_executor.submit(do_text_segmentation_on_pages)
+    elif skip_text_seg:
+        print(f"  [TextSeg] Skipped - using OneOCR char bboxes")
+
+    # Debug: Log detected bubbles count (details only if few bubbles)
+    if len(bubbles) <= 10:
+        print(f"  [Detect] L1 bubbles: {[(b['page_idx'], b['bubble_idx']) for b in bubbles]}")
 
     stats["detect_ms"] = int(detect_time)
     stats["bubbles_detected"] = len(bubbles)
@@ -870,8 +1063,13 @@ def process_images(images: List[Image.Image], api_key: str = None, output_type: 
 
     def do_ocr_l2():
         """OCR for L2 (text-free regions)."""
+        nonlocal l2_ocr_cached, l2_positions_cached, l2_ocr_time_cached
         if not bubbles_l2:
             return None, None, 0
+        # If we already ran L2 OCR for mask extraction (OneOCR), reuse that result
+        if l2_ocr_cached is not None:
+            print(f"  [OCR L2] Reusing cached result: {l2_ocr_cached.get('line_count', 0)} lines (from mask extraction)")
+            return l2_ocr_cached, l2_positions_cached, l2_ocr_time_cached
         t0 = time.time()
         if HAS_VLM_OCR:
             print(f"  [OCR L2] Using VLM for {len(bubbles_l2)} text-free regions...")
@@ -898,54 +1096,33 @@ def process_images(images: List[Image.Image], api_key: str = None, output_type: 
         stats["ocr_failed_batches"] = ocr_result['failed_batches']
     is_translated = ocr_result.get('translated', False)
 
-    # Run text segmentation on FULL PAGES (not grid)
-    # Full page text_seg gives cleaner results - doesn't falsely detect bubble edges
-    if text_seg is not None and bubbles:
-        def do_text_segmentation_on_pages():
-            t_start = time.time()
-            page_masks = {}
-            for page_idx, img in enumerate(images):
-                page_array = np.array(img)
-                page_masks[page_idx] = text_seg(page_array, verbose=False)
-            elapsed_ms = int((time.time() - t_start) * 1000)
-            print(f"  [TextSeg] {len(images)} pages in {elapsed_ms}ms")
-            return page_masks, elapsed_ms
-        text_seg_future = _parallel_executor.submit(do_text_segmentation_on_pages)
+    # Map OCR to bubbles
+    bubble_texts = map_ocr(ocr_result, positions, verbose=False)
 
-    # Map OCR to bubbles (verbose=True to debug mapping issues)
-    bubble_texts = map_ocr(ocr_result, positions, verbose=True)
-
-    # DEBUG: Show mapping summary
+    # OCR mapping summary (compact)
     all_keys = set(pos['key'] for pos in positions)
     mapped_keys = set(bubble_texts.keys())
     unmapped_keys = all_keys - mapped_keys
+    unmapped_count = len(unmapped_keys)
 
-    print(f"  [DEBUG OCR Mapping Summary]")
-    print(f"    OCR lines: {len(ocr_result.get('lines', []))}")
-    print(f"    Total bubbles: {len(all_keys)}")
-    print(f"    Mapped: {len(mapped_keys)} ({100*len(mapped_keys)/max(1,len(all_keys)):.1f}%)")
-    print(f"    Unmapped: {len(unmapped_keys)}")
+    print(f"  [OCR Map] {len(mapped_keys)}/{len(all_keys)} bubbles mapped ({100*len(mapped_keys)/max(1,len(all_keys)):.0f}%){f', {unmapped_count} unmapped' if unmapped_count else ''}")
 
-    if unmapped_keys and len(unmapped_keys) <= 20:
-        print(f"    Unmapped bubble positions:")
-        for key in sorted(unmapped_keys):
-            pos = next(p for p in positions if p['key'] == key)
-            gbox = pos['grid_box']
-            print(f"      {key}: grid_box=({gbox[0]}, {gbox[1]}, {gbox[2]}, {gbox[3]})")
-
-    print(f"    Mapped bubble_texts:")
-    for key, text_items in sorted(bubble_texts.items()):
-        texts = [t['text'][:20].replace('\n', '\\n') for t in text_items]
-        print(f"      {key}: {texts}")
-
-    # Build OCR data structure per page
+    # Build OCR data structure per page (skip non-CJK text - English/numbers only)
     ocr_data = {}
     bubble_map = {(b['page_idx'], b['bubble_idx']): b for b in bubbles}
+    skipped_non_cjk = 0
 
     for key, text_items in bubble_texts.items():
         page_idx, bubble_idx = key
         b = bubble_map.get(key)
         if b:
+            # Get combined text to check for CJK
+            combined_text = "".join(t.get('text', '') for t in text_items)
+            if not should_translate(combined_text):
+                # Skip non-CJK text entirely (English/numbers - leave as-is)
+                skipped_non_cjk += 1
+                continue
+
             if page_idx not in ocr_data:
                 ocr_data[page_idx] = []
             ocr_data[page_idx].append({
@@ -958,12 +1135,9 @@ def process_images(images: List[Image.Image], api_key: str = None, output_type: 
     for page_idx in ocr_data:
         ocr_data[page_idx].sort(key=lambda x: x['idx'])
 
-    # DEBUG: Log final OCR data
-    print(f"    Final ocr_data for rendering:")
-    for page_idx in sorted(ocr_data.keys()):
-        for bubble in ocr_data[page_idx]:
-            ocr_text = "".join([t['text'] for t in bubble['texts']])[:25].replace('\n', '\\n')
-            print(f"      Page {page_idx}, Bubble {bubble['idx']}: box={bubble['bubble_box']}, ocr='{ocr_text}'")
+    total_l1_bubbles = sum(len(v) for v in ocr_data.values())
+    if skipped_non_cjk > 0:
+        print(f"  [OCR] Skipped {skipped_non_cjk} non-CJK bubbles (English/numbers)")
 
     # Wait for L2 OCR (if running)
     l2_ocr_result = None
@@ -981,36 +1155,43 @@ def process_images(images: List[Image.Image], api_key: str = None, output_type: 
             l2_bubble_texts = map_ocr(l2_ocr_result, l2_positions)
             l2_bubble_map = {(b['page_idx'], b['bubble_idx']): b for b in bubbles_l2}
 
+            # Track ALL L2 regions - will restore those without CJK OCR results
+            # Start with all L2 regions as "to restore", then remove ones with CJK text
+            all_l2_regions = {(b['page_idx'], b['bubble_idx']): {'page_idx': b['page_idx'], 'box': list(b['box'])}
+                             for b in bubbles_l2}
+            l2_with_cjk = set()  # Keys of L2 regions with CJK text (will be processed)
+
             for key, text_items in l2_bubble_texts.items():
                 page_idx, bubble_idx = key
                 b = l2_bubble_map.get(key)
                 if b:
-                    if page_idx not in l2_ocr_data:
-                        l2_ocr_data[page_idx] = []
-                    l2_ocr_data[page_idx].append({
-                        'idx': bubble_idx,
-                        'bubble_box': list(b['box']),
-                        'texts': text_items
-                    })
+                    combined_text = "".join(t.get('text', '') for t in text_items)
+                    if should_translate(combined_text):
+                        # Has CJK text - will be translated, add to ocr_data
+                        l2_with_cjk.add(key)
+                        if page_idx not in l2_ocr_data:
+                            l2_ocr_data[page_idx] = []
+                        l2_ocr_data[page_idx].append({
+                            'idx': bubble_idx,
+                            'bubble_box': list(b['box']),
+                            'texts': text_items
+                        })
 
-            # DEBUG: Log L2 OCR data
-            print(f"  [DEBUG L2 OCR Mapping]")
-            print(f"    L2 mapped bubble_texts: {len(l2_bubble_texts)} entries")
-            for key, text_items in sorted(l2_bubble_texts.items()):
-                texts = [t['text'][:20].replace('\n', '\\n') for t in text_items]
-                print(f"      {key}: {texts}")
-            print(f"    L2 ocr_data for rendering:")
-            for page_idx in sorted(l2_ocr_data.keys()):
-                for bubble in l2_ocr_data[page_idx]:
-                    ocr_text = "".join([t['text'] for t in bubble['texts']])[:25].replace('\n', '\\n')
-                    print(f"      Page {page_idx}, Bubble {bubble['idx']}: box={bubble['bubble_box']}, ocr='{ocr_text}'")
+            # L2 regions to restore = all L2 regions MINUS those with CJK text
+            l2_skipped_regions = [info for key, info in all_l2_regions.items() if key not in l2_with_cjk]
+
+            # L2 OCR mapping summary
+            l2_total = sum(len(v) for v in l2_ocr_data.values())
+            restore_count = len(l2_skipped_regions)
+            skip_msg = f", restoring {restore_count} non-CJK/empty" if restore_count else ""
+            print(f"  [OCR Map L2] {l2_total} regions with CJK text{skip_msg}")
 
     # Sequential model loading: stop OCR server after ALL OCR is done (L1 + L2)
     if SEQUENTIAL_MODEL_LOADING and uses_vlm_ocr and HAS_VLM_OCR:
         seq_mgr = get_sequential_manager()
         seq_mgr.stop_ocr_server()
 
-    # Extract texts for translation (or use already-translated texts)
+    # Extract texts for translation (non-CJK already filtered out in ocr_data building)
     all_texts = []
     text_mapping = []  # (page_idx, bubble_idx, is_l2)
     is_already_translated = ocr_result.get('translated', False)
@@ -1025,7 +1206,7 @@ def process_images(images: List[Image.Image], api_key: str = None, output_type: 
 
     l1_text_count = len(all_texts)
 
-    # L2 texts (separate batch tracking)
+    # L2 texts
     for page_idx, page_bubbles in sorted(l2_ocr_data.items()):
         for bubble in page_bubbles:
             merged = merge_ocr_texts_for_translation(bubble['texts'], bubble.get('bubble_box'))
@@ -1127,25 +1308,10 @@ def process_images(images: List[Image.Image], api_key: str = None, output_type: 
                 translation_data[page_idx] = {}
             translation_data[page_idx][bubble_idx] = trans_text
 
-    # DEBUG: Log translation mapping
-    print(f"  [DEBUG Translation Mapping]")
-    print(f"    text_mapping ({len(text_mapping)} entries):")
-    for i, (page_idx, bubble_idx, is_l2) in enumerate(text_mapping):
-        src = all_texts[i][:40].replace('\n', ' ') if i < len(all_texts) else '?'
-        trans = translations[i][:50].replace('\n', ' ') if i < len(translations) else '?'
-        label = "L2" if is_l2 else "L1"
-        print(f"      [{i}] page={page_idx}, bubble={bubble_idx} ({label}): '{src}' → '{trans}'")
-
-    print(f"    L1 translation_data:")
-    for page_idx in sorted(translation_data.keys()):
-        for bubble_idx, trans in sorted(translation_data[page_idx].items()):
-            print(f"      Page {page_idx}, Bubble {bubble_idx}: '{trans[:60]}'")
-
-    if l2_translation_data:
-        print(f"    L2 translation_data:")
-        for page_idx in sorted(l2_translation_data.keys()):
-            for bubble_idx, trans in sorted(l2_translation_data[page_idx].items()):
-                print(f"      Page {page_idx}, Bubble {bubble_idx}: '{trans[:60]}'")
+    # Translation mapping summary (compact)
+    l1_count = len(translation_data)
+    l2_count = len(l2_translation_data)
+    print(f"  [Translate Map] L1: {sum(len(v) for v in translation_data.values())} bubbles, L2: {sum(len(v) for v in l2_translation_data.values())} regions")
 
     # Handle different output types
     if output_type == "text_only":
@@ -1190,10 +1356,10 @@ def process_images(images: List[Image.Image], api_key: str = None, output_type: 
                 text_seg_masks = None
 
         # Use L2-inpainted images (or original if no L2 inpainting)
-        # Note: L1 (text bubbles) are NOT inpainted - translated text is rendered directly
         source_images = inpainted_images if use_inpaint else images
 
         # Extract and return cropped bubble images with positions
+        # Note: Text clearing now samples background color for colored backgrounds (no L1 AOT needed)
         t0 = time.time()
         bubble_images_output = {}
         for page_idx, page_bubbles in sorted(ocr_data.items()):
@@ -1220,7 +1386,8 @@ def process_images(images: List[Image.Image], api_key: str = None, output_type: 
                     'texts': bubble['texts']
                 }
                 temp_translations = {bubble['idx']: page_translations.get(bubble['idx'], "[MISSING]")}
-                # Use precomputed mask region for text cleaning
+
+                # Use precomputed mask region for text cleaning (background color sampled automatically)
                 rendered_bubble = render_text_on_image(bubble_copy, [temp_bubble], temp_translations, use_inpaint=use_inpaint, precomputed_mask=bubble_mask)
 
                 # Convert to base64
@@ -1268,10 +1435,21 @@ def process_images(images: List[Image.Image], api_key: str = None, output_type: 
                 text_seg_masks = None
 
         # Use L2-inpainted images (or original if no L2 inpainting)
-        # Note: L1 (text bubbles) are NOT inpainted - translated text is rendered directly
         source_images = inpainted_images if use_inpaint else images
 
-        # Render full pages (text_seg already done on grid, masks mapped back)
+        # Restore original regions for non-CJK L2 bubbles (they got inpainted but shouldn't have)
+        if use_inpaint and l2_skipped_regions:
+            for skip_info in l2_skipped_regions:
+                page_idx = skip_info['page_idx']
+                x1, y1, x2, y2 = skip_info['box']
+                if page_idx < len(source_images) and page_idx < len(images):
+                    # Copy original region back to inpainted image
+                    orig_region = images[page_idx].crop((x1, y1, x2, y2))
+                    source_images[page_idx].paste(orig_region, (x1, y1))
+            print(f"  [Restore] {len(l2_skipped_regions)} non-CJK L2 regions restored from original")
+
+        # Render full pages
+        # Note: Text clearing now samples background color for colored backgrounds (no L1 AOT needed)
         t0 = time.time()
         output_images = []
         render_timing = {}  # Collect detailed timing
@@ -1282,13 +1460,17 @@ def process_images(images: List[Image.Image], api_key: str = None, output_type: 
             page_bubbles = ocr_data.get(page_idx, [])
             page_translations = translation_data.get(page_idx, {})
             page_mask = text_seg_masks.get(page_idx) if text_seg_masks else None
-            rendered = render_text_on_image(img_copy, page_bubbles, page_translations, use_inpaint=use_inpaint, precomputed_mask=page_mask, timing=render_timing)
 
-            # Step 2: Render L2 translations (no clearing - already inpainted)
+            rendered = render_text_on_image(img_copy, page_bubbles, page_translations, use_inpaint=use_inpaint, precomputed_mask=page_mask, timing=render_timing, prefer_mask=force_text_seg)
+
+            # Step 2: Render L2 translations (use same text_seg mask for any residual text after AOT)
             page_l2_bubbles = l2_ocr_data.get(page_idx, [])
             page_l2_translations = l2_translation_data.get(page_idx, {})
             if page_l2_bubbles and page_l2_translations:
-                rendered = render_text_on_image(rendered, page_l2_bubbles, page_l2_translations, use_inpaint=True, precomputed_mask=None, timing=render_timing)
+                # Use page_mask for L2 too - handles imperfect AOT inpainting
+                # If AOT disabled, use white text on white background
+                aot_enabled_for_render = get_aot_inpaint_enabled_runtime()
+                rendered = render_text_on_image(rendered, page_l2_bubbles, page_l2_translations, use_inpaint=aot_enabled_for_render, precomputed_mask=page_mask, timing=render_timing, prefer_mask=force_text_seg, force_white_text=not aot_enabled_for_render)
 
             output_images.append(rendered)
 
@@ -1348,7 +1530,7 @@ def process_images_legacy(images: List[Image.Image], api_key: str = None, output
         seq_mgr = get_sequential_manager()
         seq_mgr.stop_ocr_server()
 
-    # Build OCR data
+    # Build OCR data (skip non-CJK text)
     ocr_data = {}
     bubble_map = {(b['page_idx'], b['bubble_idx']): b for b in bubbles_l1}
 
@@ -1356,6 +1538,11 @@ def process_images_legacy(images: List[Image.Image], api_key: str = None, output
         page_idx, bubble_idx = key
         b = bubble_map.get(key)
         if b:
+            # Skip non-CJK text entirely
+            combined_text = "".join(t.get('text', '') for t in text_items)
+            if not should_translate(combined_text):
+                continue
+
             if page_idx not in ocr_data:
                 ocr_data[page_idx] = []
             ocr_data[page_idx].append({

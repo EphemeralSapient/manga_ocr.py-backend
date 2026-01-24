@@ -8,6 +8,13 @@ import requests
 from PIL import Image
 from collections import defaultdict
 
+# Config for OneOCR grid size
+try:
+    from config import get_oneocr_grid_width, get_oneocr_grid_height
+except ImportError:
+    def get_oneocr_grid_width(): return 1200
+    def get_oneocr_grid_height(): return 1200
+
 # Load Windows OneOCR module (importlib avoids name conflict with this file)
 try:
     _spec = importlib.util.spec_from_file_location('oneocr', os.path.join(os.path.dirname(__file__), 'ocr', 'oneocr.py'))
@@ -116,7 +123,7 @@ class OneOCRRemote:
         lines = []
         for result in data.get('results', []):
             bbox = result.get('bbox', [0, 0, 0, 0])
-            lines.append({
+            line_item = {
                 'text': result.get('text', ''),
                 'bbox': {
                     'x': bbox[0],
@@ -125,7 +132,15 @@ class OneOCRRemote:
                     'height': bbox[3] - bbox[1],
                 },
                 'confidence': result.get('confidence', 1.0)
-            })
+            }
+            # Include character-level bboxes if available (for precise text clearing)
+            chars = result.get('chars', [])
+            if chars:
+                line_item['chars'] = [
+                    {'char': c.get('char', ''), 'bbox': c.get('bbox', [])}
+                    for c in chars if c.get('bbox')
+                ]
+            lines.append(line_item)
 
         # Fix Windows DPI scaling issue: normalize coordinates if they exceed image bounds
         if lines:
@@ -146,35 +161,42 @@ class OneOCRRemote:
 
         return {'lines': lines, 'line_count': len(lines)}
 
-    def run_batched(self, bubbles, row_width=600, padding=30, translate=False, max_height=600):
+    def run_batched(self, bubbles, row_width=None, padding=30, translate=False, max_height=None):
         """Run OCR on multiple bubbles using grid (like Windows OneOCR).
 
         Args:
             bubbles: List of bubble dicts with 'image' key
-            row_width: Max width for grid rows (default 600)
+            row_width: Max width for grid rows (default from config)
             padding: Padding between cells (default 30)
             translate: Not supported for OneOCR (ignored)
-            max_height: Max height for each grid batch (default 600)
+            max_height: Max height for each grid batch (default from config)
 
         Returns:
             (ocr_result, positions, grid_image)
             Note: grid_image is the first batch only (for debugging)
+
+        Note: All batches are sent to the server in PARALLEL for faster processing.
+              The server receives them async but processes OCR sequentially.
         """
         if not bubbles:
             return {'lines': [], 'line_count': 0}, [], None
 
-        all_lines = []
-        all_positions = []
-        first_grid_img = None
-        batch_num = 0
+        # Use config values if not specified
+        if row_width is None:
+            row_width = get_oneocr_grid_width()
+        if max_height is None:
+            max_height = get_oneocr_grid_height()
+
+        # Phase 1: Create ALL grid batches first
+        batches = []  # List of (batch_num, grid_img, positions)
         remaining = bubbles
+        batch_num = 0
 
         while remaining:
             batch_num += 1
-            # Create grid from remaining bubbles (respecting max_height)
             grid_img, positions, remaining = grid_bubbles(remaining, row_width, padding, max_height)
 
-            # Debug: save grid image for inspection
+            # Debug: save grid image
             try:
                 debug_path = os.path.join(os.path.dirname(__file__), '..', 'output', f'debug_ocr_grid_batch{batch_num}.png')
                 os.makedirs(os.path.dirname(debug_path), exist_ok=True)
@@ -183,12 +205,53 @@ class OneOCRRemote:
             except Exception as e:
                 print(f"[OCR] Debug: Could not save grid image: {e}")
 
-            if first_grid_img is None:
-                first_grid_img = grid_img
+            batches.append((batch_num, grid_img, positions))
 
-            # Run OCR on this batch's grid
+        if not batches:
+            return {'lines': [], 'line_count': 0}, [], None
+
+        first_grid_img = batches[0][1]
+        total_batches = len(batches)
+
+        # Phase 2: Send ALL requests in PARALLEL
+        if total_batches == 1:
+            # Single batch - no need for parallel
+            batch_num, grid_img, positions = batches[0]
             ocr_result = self.run(grid_img)
+            ocr_results = [(batch_num, ocr_result, grid_img, positions)]
+        else:
+            # Multiple batches - send in parallel using ThreadPoolExecutor
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
+            print(f"[OCR] Sending {total_batches} batches in parallel...")
+
+            def process_batch(batch_data):
+                batch_num, grid_img, positions = batch_data
+                try:
+                    ocr_result = self.run(grid_img)
+                    return (batch_num, ocr_result, grid_img, positions, None)
+                except Exception as e:
+                    return (batch_num, None, grid_img, positions, str(e))
+
+            ocr_results = []
+            with ThreadPoolExecutor(max_workers=total_batches) as executor:
+                futures = {executor.submit(process_batch, batch): batch[0] for batch in batches}
+
+                for future in as_completed(futures):
+                    batch_num, ocr_result, grid_img, positions, error = future.result()
+                    if error:
+                        print(f"[OCR] ERROR: Batch {batch_num} failed: {error}")
+                    else:
+                        ocr_results.append((batch_num, ocr_result, grid_img, positions))
+
+            # Sort by batch number to maintain order
+            ocr_results.sort(key=lambda x: x[0])
+
+        # Phase 3: Merge results
+        all_lines = []
+        all_positions = []
+
+        for batch_num, ocr_result, grid_img, positions in ocr_results:
             # Debug: Check for out-of-bounds OCR coordinates
             out_of_bounds = []
             for line in ocr_result.get('lines', []):
@@ -209,7 +272,6 @@ class OneOCRRemote:
             for pos in positions:
                 pos['batch_idx'] = batch_num
 
-            # Accumulate results
             all_lines.extend(ocr_result.get('lines', []))
             all_positions.extend(positions)
 
@@ -217,11 +279,11 @@ class OneOCRRemote:
         combined_result = {
             'lines': all_lines,
             'line_count': len(all_lines),
-            'batches': batch_num
+            'batches': total_batches
         }
 
-        if batch_num > 1:
-            print(f"[OCR] Processed {len(bubbles)} bubbles in {batch_num} batches")
+        if total_batches > 1:
+            print(f"[OCR] Processed {len(bubbles)} bubbles in {total_batches} batches (parallel)")
 
         return combined_result, all_positions, first_grid_img
 
@@ -402,20 +464,26 @@ def _get_gemini_ocr():
     return _gemini_ocr
 
 
-def grid_bubbles(bubbles, row_width=600, padding=30, max_height=600):
+def grid_bubbles(bubbles, row_width=None, padding=30, max_height=None):
     """Arrange bubble crops into a grid for batch OCR.
 
     Args:
         bubbles: List of bubble dicts with 'image' key
-        row_width: Max width for grid (default 600)
+        row_width: Max width for grid (default from config)
         padding: Padding between cells (default 30)
-        max_height: Max height for grid (default 600). If bubbles don't fit,
+        max_height: Max height for grid (default from config). If bubbles don't fit,
                     returns remaining bubbles for next batch.
 
     Returns:
         (grid_image, positions, remaining_bubbles)
         remaining_bubbles will be empty if all fit, otherwise contains bubbles for next batch
     """
+    # Use config values if not specified
+    if row_width is None:
+        row_width = get_oneocr_grid_width()
+    if max_height is None:
+        max_height = get_oneocr_grid_height()
+
     if not bubbles:
         return Image.new('RGB', (100, 100), (255, 255, 255)), [], []
 
@@ -525,7 +593,7 @@ def _get_configured_ocr_method():
         return "qwen_vlm", False, False
 
 
-def run_ocr_on_bubbles(bubbles, row_width=600, padding=30, ocr_url=OCR_URL, translate=False):
+def run_ocr_on_bubbles(bubbles, row_width=None, padding=30, ocr_url=OCR_URL, translate=False):
     """
     High-level OCR: create grid and run OCR in one call.
 
@@ -536,13 +604,17 @@ def run_ocr_on_bubbles(bubbles, row_width=600, padding=30, ocr_url=OCR_URL, tran
 
     Args:
         bubbles: List of bubble dicts
-        row_width: Max width for grid rows
+        row_width: Max width for grid rows (default from config)
         padding: Padding between cells
         ocr_url: URL for HTTP OCR fallback
         translate: If True and using VLM/API, output English translations directly
 
     Returns: (ocr_result, positions, grid_image)
     """
+    # Use config value if not specified
+    if row_width is None:
+        row_width = get_oneocr_grid_width()
+
     ocr_method, is_api, is_remote = _get_configured_ocr_method()
 
     # Try OneOCR Remote if configured (doesn't support translate mode)
@@ -643,10 +715,22 @@ def map_ocr(ocr_result, positions, is_translated=None, verbose=False):
             stats['skipped_empty'] += 1
             continue
 
-        # Skip Japanese character filter if output is already translated to English
+        # Skip character filter if output is already translated to English
         if not is_translated:
-            # Include: hiragana, katakana, CJK, and half-width katakana (U+FF65-U+FF9F)
-            if not any('\u3040' <= c <= '\u30ff' or '\u4e00' <= c <= '\u9fff' or '\uff65' <= c <= '\uff9f' for c in text):
+            # Include: hiragana, katakana, CJK, half-width katakana, and Korean Hangul
+            # \u3040-\u30ff: Hiragana + Katakana (Japanese)
+            # \u4e00-\u9fff: CJK Unified Ideographs (Chinese/Japanese/Korean)
+            # \uff65-\uff9f: Half-width Katakana
+            # \uac00-\ud7af: Korean Hangul syllables
+            # \u1100-\u11ff: Korean Hangul Jamo
+            if not any(
+                '\u3040' <= c <= '\u30ff' or  # Japanese kana
+                '\u4e00' <= c <= '\u9fff' or  # CJK ideographs
+                '\uff65' <= c <= '\uff9f' or  # Half-width katakana
+                '\uac00' <= c <= '\ud7af' or  # Korean Hangul syllables
+                '\u1100' <= c <= '\u11ff'     # Korean Hangul Jamo
+                for c in text
+            ):
                 stats['skipped_no_japanese'] += 1
                 continue
 
@@ -750,12 +834,28 @@ def map_ocr(ocr_result, positions, is_translated=None, verbose=False):
             ox, oy = pos['grid_offset']
             bx, by = pos['bubble_box'][:2]
             px, py = pos.get('crop_offset', (0, 0))
-            results[pos['key']].append({
+            result_item = {
                 'text': text,
                 'bbox': [int(bbox['x'] - ox + bx - px), int(bbox['y'] - oy + by - py),
                          int(bbox['x'] - ox + bx - px + bbox['width']),
                          int(bbox['y'] - oy + by - py + bbox['height'])]
-            })
+            }
+            # Transform char bboxes to bubble coordinates (for precise text clearing)
+            chars = line.get('chars', [])
+            if chars:
+                transformed_chars = []
+                for c in chars:
+                    cb = c.get('bbox', [])
+                    if len(cb) == 4:
+                        # Transform from grid coords to bubble coords
+                        transformed_chars.append({
+                            'char': c.get('char', ''),
+                            'bbox': [int(cb[0] - ox + bx - px), int(cb[1] - oy + by - py),
+                                     int(cb[2] - ox + bx - px), int(cb[3] - oy + by - py)]
+                        })
+                if transformed_chars:
+                    result_item['chars'] = transformed_chars
+            results[pos['key']].append(result_item)
             matched = True
             stats['matched_bbox'] += 1
 

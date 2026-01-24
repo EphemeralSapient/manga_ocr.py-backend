@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Translation Module - Japanese to English manga translation
+Translation Module - Comic/manga translation to English
 
 Uses Cerebras API for translation with:
 - Batch processing for efficiency
 - Parallel execution
 - [NO TEXT] markers for sound effects/meaningless text
+- Language agnostic (Japanese, Korean, Chinese, etc.)
 """
 
 import os
@@ -36,14 +37,23 @@ BATCH_SIZE = 100
 MAX_WORKERS = 5
 MODEL = "gpt-oss-120b"
 
-SYSTEM_PROMPT = """You are a Japanese to English translator for manga. Translate each numbered Japanese text to English accurately. Keep the same order. Return translations in the translated array WITHOUT numbers. If the input is meaningless (single random characters, sound effects like 'ぎゅっ', symbols, or gibberish that doesn't form proper text), return [NO TEXT] for that entry.
+SYSTEM_PROMPT = """You are a comic/manga/webtoon translator. Translate each numbered text to natural English. Return translations in the translated array WITHOUT numbers.
 
-IMPORTANT: Some inputs may be in bracketed format like [phrase1,phrase2] - this means multiple text segments were detected in the same speech bubble but the reading order is uncertain. Use Japanese grammar to determine the correct order:
-- Phrases ending with particles (に, を, が, は, で, etc.) usually continue to the next phrase
-- Phrases ending with verb forms (だ, です, る, た, か, よ, ね) usually complete a sentence
-- Adverbs (とりあえず, やっぱり, etc.) typically come before the verb phrase they modify
+CRITICAL: You MUST translate ALL dialogue text. Only use [NO TEXT] for:
+- Pure sound effects with NO meaning (ドドド, ゴゴゴ, 쾅쾅)
+- Random symbols or completely illegible text
+- Single characters that are just decorative
 
-Reorder the phrases to form a grammatically correct sentence, then translate naturally."""
+RULES:
+1. TRANSLATE dialogue, thoughts, narration, and meaningful exclamations - even short ones like あ! (Ah!), え? (Huh?), うん (Yeah)
+2. NEVER add brackets [] to translations. Only keep brackets if the ORIGINAL text literally starts with [
+3. Multi-line inputs are from the same speech bubble - combine into one natural sentence
+4. Consider story context - maintain consistent tone and flow
+
+For Japanese: Use grammar (particles, verb endings) to determine correct phrase order.
+For Korean: Text order is usually correct. Focus on natural, contextual translation.
+
+Output clean, natural English. When in doubt, TRANSLATE - don't mark as [NO TEXT]."""
 
 
 def translate_batch(
@@ -57,11 +67,6 @@ def translate_batch(
     batch_info = {"batch_idx": batch_idx, "count": len(batch), "status": "success"}
 
     numbered = [f"{i+1}. {t}" for i, t in enumerate(batch)]
-    # Log what we're sending
-    input_preview = json.dumps(numbered[:5], ensure_ascii=False)
-    if len(numbered) > 5:
-        input_preview = input_preview[:-1] + f', ... +{len(numbered)-5} more]'
-    print(f"    [Translate] Batch {batch_idx} sending {len(batch)} texts: {input_preview[:300]}")
 
     last_error = None
     for attempt in range(max_retries):
@@ -77,7 +82,7 @@ def translate_batch(
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {
                         "role": "user",
-                        "content": f"Translate these {len(batch)} Japanese texts to English:\n{json.dumps(numbered, ensure_ascii=False)}"
+                        "content": f"Translate these {len(batch)} texts to English:\n{json.dumps(numbered, ensure_ascii=False)}"
                     }
                 ],
                 model=MODEL,
@@ -108,48 +113,24 @@ def translate_batch(
             batch_info["finish_reason"] = completion.choices[0].finish_reason
 
             if content:
-                # Log raw response
-                print(f"    [Translate] Batch {batch_idx} response ({len(content)} chars): {content[:300]}{'...' if len(content) > 300 else ''}")
-
                 result = json.loads(content)
                 translations = result.get("translated", [])
-
-                # Log translation breakdown
-                no_text = sum(1 for t in translations if t == "[NO TEXT]")
-                empty = sum(1 for t in translations if not t)
-                actual = len(translations) - no_text - empty
-                print(f"    [Translate] Batch {batch_idx} parsed: {actual} translations, {no_text} [NO TEXT], {empty} empty")
 
                 # Pad if needed
                 if len(translations) < len(batch):
                     batch_info["status"] = f"partial ({len(translations)}/{len(batch)})"
-                    print(f"    [Translate] Batch {batch_idx} WARNING: got {len(translations)} translations for {len(batch)} inputs")
                 while len(translations) < len(batch):
                     translations.append("[TRANSLATION FAILED]")
                 return batch_idx, translations[:len(batch)], batch_info
             else:
                 batch_info["status"] = "empty_response"
-                print(f"    [Translate] Batch {batch_idx} empty response, finish_reason: {batch_info['finish_reason']}")
 
         except Exception as e:
             last_error = e
             batch_info["time_ms"] = int((time.time() - batch_start) * 1000)
             batch_info["status"] = f"error: {type(e).__name__}"
             batch_info["error"] = str(e)
-
-            # Print detailed error info
-            print(f"    [Translate] Batch {batch_idx} error: {type(e).__name__}: {e}")
-            if hasattr(e, 'response'):
-                print(f"    [Translate] Response: {e.response}")
-            if hasattr(e, 'status_code'):
-                print(f"    [Translate] Status code: {e.status_code}")
-            if hasattr(e, 'body'):
-                print(f"    [Translate] Body: {e.body}")
-            if hasattr(e, 'message'):
-                print(f"    [Translate] Message: {e.message}")
-            # For connection errors, show more details
-            if hasattr(e, '__cause__') and e.__cause__:
-                print(f"    [Translate] Cause: {type(e).__name__}: {e.__cause__}")
+            print(f"    [Translate] Batch {batch_idx} error: {type(e).__name__}: {str(e)[:100]}")
 
             # Check if we should retry (rate limit or server error)
             is_retryable = (
@@ -214,6 +195,43 @@ def translate_texts(
 
     for result in batch_results:
         all_translations.extend(result)
+
+    # Retry failed translations (collect indices, retry in smaller batches)
+    failed_indices = [i for i, t in enumerate(all_translations) if t == "[TRANSLATION FAILED]"]
+    if failed_indices and len(failed_indices) <= len(texts) * 0.5:  # Only retry if <50% failed
+        if verbose:
+            print(f"    [Retry] {len(failed_indices)} failed translations, retrying...")
+
+        # Retry failed texts in smaller batches of 20
+        retry_batch_size = 20
+        failed_texts = [texts[i] for i in failed_indices]
+        retry_batches = [failed_texts[i:i + retry_batch_size] for i in range(0, len(failed_texts), retry_batch_size)]
+
+        retry_results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(retry_batches), MAX_WORKERS)) as executor:
+            futures = {
+                executor.submit(translate_batch, client, i, batch): i
+                for i, batch in enumerate(retry_batches)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                batch_idx, translations, info = future.result()
+                retry_results.append((batch_idx, translations))
+
+        # Sort by batch_idx and flatten
+        retry_results.sort(key=lambda x: x[0])
+        retry_translations = []
+        for _, trans in retry_results:
+            retry_translations.extend(trans)
+
+        # Update original translations with retry results
+        retry_success = 0
+        for i, orig_idx in enumerate(failed_indices):
+            if i < len(retry_translations) and retry_translations[i] != "[TRANSLATION FAILED]":
+                all_translations[orig_idx] = retry_translations[i]
+                retry_success += 1
+
+        if verbose:
+            print(f"    [Retry] Recovered {retry_success}/{len(failed_indices)} translations")
 
     total_time = int((time.time() - t0) * 1000)
 

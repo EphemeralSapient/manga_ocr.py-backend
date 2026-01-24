@@ -168,6 +168,21 @@ DEFAULT_CONFIG = {
     # Text segmentation input size (1024 recommended)
     "text_seg_input_size": 1024,
 
+    # Force text_seg mask for text clearing instead of OneOCR char bboxes
+    # When False (default): Uses OneOCR character bboxes for fast, precise clearing
+    # When True: Uses text_seg model for pixel-level masking (slower but more precise)
+    "force_text_seg_mask": False,
+
+    # Enable AOT (Anything-on-Text) inpainting for L2 regions
+    # When True (default): Uses AOT-GAN to inpaint text in L2 regions
+    # When False: Fills L2 regions with white background and uses white text
+    "aot_inpaint_enabled": True,
+
+    # OneOCR grid size limits (for batching bubbles)
+    # Larger values = fewer batches but more memory usage
+    "oneocr_grid_width": 1200,
+    "oneocr_grid_height": 1200,
+
     # ══════════════════════════════════════════════════════════════════════════
     # Translation API Settings (config.json only)
     # ══════════════════════════════════════════════════════════════════════════
@@ -426,6 +441,18 @@ def get_text_seg_model() -> str:
 
 def get_text_seg_input_size() -> int:
     return get("text_seg_input_size", 1024)
+
+def get_force_text_seg_mask() -> bool:
+    return get("force_text_seg_mask", False)
+
+def get_aot_inpaint_enabled() -> bool:
+    return get("aot_inpaint_enabled", True)
+
+def get_oneocr_grid_width() -> int:
+    return get("oneocr_grid_width", 1200)
+
+def get_oneocr_grid_height() -> int:
+    return get("oneocr_grid_height", 1200)
 
 # Translation settings
 def get_translation_temperature() -> float:

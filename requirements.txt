@@ -23,6 +23,9 @@ coremltools; sys_platform == 'darwin'
 # Translation API
 cerebras-cloud-sdk
 
+# Text rendering (Skia - fast auto-wrap layout)
+skia-python
+
 # NOTE: onnxruntime is installed separately by install_runtime.py
 # It detects your hardware and installs the optimal variant:
 #   - onnxruntime-gpu      (NVIDIA CUDA)

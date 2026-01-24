@@ -50,6 +50,9 @@ from .render import (
     render_text_on_image,
     fit_text,
     get_font,
+    check_bbox_edges_white,
+    check_bubble_background_white,
+    find_l1_bubbles_needing_aot,
 )
 
 # Translation
@@ -96,6 +99,7 @@ __all__ = [
     'create_text_segmenter', 'get_text_segmenter', 'reset_text_segmenter', 'TextSegmenter',
     # Rendering
     'render_text_on_image', 'fit_text', 'get_font',
+    'check_bbox_edges_white', 'check_bubble_background_white', 'find_l1_bubbles_needing_aot',
     # Translation
     'translate_texts', 'TRANSLATION_BATCH_SIZE',
     'translate_texts_gemini', 'check_gemini_translate_available',
